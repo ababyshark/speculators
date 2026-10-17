@@ -3,10 +3,13 @@
 import logging
 from pathlib import Path
 
+import httpx
+import openai
 import torch
 from datasets import Dataset
 
 import speculators.train.data as data_module
+from speculators.data_generation.endpoint_router import EndpointRouter
 from speculators.models.eagle3.data import shift_batch
 from speculators.train.data import (
     ArrowDataset,
@@ -17,6 +20,24 @@ from speculators.train.recovery import (
     RecoveryMetadata,
     SampleUnavailable,
 )
+
+
+class _EndpointClient:
+    """Stand-in for an openai client, tagged with its endpoint URL."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+
+def _connection_error(endpoint: str) -> openai.APIConnectionError:
+    request = httpx.Request("POST", endpoint)
+    return openai.APIConnectionError(request=request)
+
+
+def _status_error(code: int) -> openai.APIStatusError:
+    request = httpx.Request("POST", "http://fake:8000/v1")
+    response = httpx.Response(code, request=request)
+    return openai.APIStatusError(f"status {code}", response=response, body=None)
 
 
 def test_shift_batch():
@@ -277,7 +298,12 @@ def _make_generation_dataset(
         **kwargs,
     )
     arrow_ds.data.set_format(type="torch")
-    arrow_ds.client = object()  # type: ignore[assignment]
+    # Bypass endpoint discovery/transfer setup: the fake transfer needs none
+    # and the patched generate_hidden_states never touches the client.
+    arrow_ds.router = EndpointRouter(
+        ["http://fake:8000/v1"], client_factory=lambda _ep: object()
+    )
+    arrow_ds._endpoints_ready = True
     arrow_ds.model = "model"
     return arrow_ds
 
@@ -432,3 +458,118 @@ def test_collator_keeps_valid_samples_when_one_generation_fails():
     assert metadata.failure_count == 1
     assert collated["loss_mask"].sum() == 2
     assert torch.equal(collated["input_ids"][0, :2], torch.tensor([1, 2]))
+
+
+def test_failover_rotates_to_healthy_endpoint(tmp_path, monkeypatch):
+    transfer = _SequenceTransfer([_valid_generated_sample()])
+    arrow_ds = _make_generation_dataset(tmp_path, transfer, max_retries=2)
+    arrow_ds.router = EndpointRouter(
+        ["http://bad:8000/v1", "http://good:8000/v1"],
+        client_factory=_EndpointClient,
+    )
+    calls = []
+
+    def fake_generate(client, _model, _item, *, timeout=None, max_retries=0):
+        calls.append(client.name)
+        if client.name == "http://bad:8000/v1":
+            raise _connection_error(client.name)
+        return _next_generation_result(iter(["good-handle"]))
+
+    monkeypatch.setattr(data_module, "generate_hidden_states", fake_generate)
+
+    item = arrow_ds[0]
+
+    assert isinstance(item, dict)
+    assert item["hidden_states"].shape == (3, 4)
+    assert calls == ["http://bad:8000/v1", "http://good:8000/v1"]
+    assert arrow_ds.router.stats("http://bad:8000/v1")["failures"] == 1
+    assert arrow_ds.router.stats("http://good:8000/v1")["failures"] == 0
+    # One connection failure is below the eviction threshold (2): the endpoint
+    # stays in rotation and the sample never counts as a recovery failure.
+    assert arrow_ds.router.is_healthy("http://bad:8000/v1")
+    assert arrow_ds.generation_recovery.consecutive_failures == 0
+
+
+def test_failover_evicts_endpoint_after_threshold_and_recovers(tmp_path, monkeypatch):
+    transfer = _SequenceTransfer([_valid_generated_sample(), _valid_generated_sample()])
+    arrow_ds = _make_generation_dataset(tmp_path, transfer, max_retries=2)
+    arrow_ds.router = EndpointRouter(
+        ["http://bad:8000/v1", "http://good:8000/v1"],
+        client_factory=_EndpointClient,
+        failure_threshold=2,
+    )
+    bad_calls = 0
+
+    def fake_generate(client, _model, _item, *, timeout=None, max_retries=0):
+        nonlocal bad_calls
+        if client.name == "http://bad:8000/v1":
+            bad_calls += 1
+            raise _connection_error(client.name)
+        return _next_generation_result(iter(["h1", "h2"]))
+
+    monkeypatch.setattr(data_module, "generate_hidden_states", fake_generate)
+
+    assert isinstance(arrow_ds[0], dict)
+    assert bad_calls == 1  # RR alternates: one failure per sample on 'bad'
+    assert arrow_ds.router.is_healthy("http://bad:8000/v1")
+
+    assert isinstance(arrow_ds[0], dict)
+    assert bad_calls == 2  # second failure -> threshold reached mid-sample
+    assert not arrow_ds.router.is_healthy("http://bad:8000/v1")
+    assert bad_calls == 2  # evicted endpoint gets no more traffic
+    # third sample: served by the good endpoint alone
+    assert arrow_ds.transfer.generated_results == []
+
+
+def test_semantic_error_fails_fast_without_endpoint_eviction(tmp_path, monkeypatch):
+    transfer = _SequenceTransfer([])
+    arrow_ds = _make_generation_dataset(
+        tmp_path,
+        transfer,
+        max_retries=2,
+        generation_validation_retries=0,
+    )
+    arrow_ds.router = EndpointRouter(
+        ["http://a:8000/v1", "http://b:8000/v1"],
+        client_factory=_EndpointClient,
+    )
+    calls = []
+
+    def fake_generate(client, _model, _item, *, timeout=None, max_retries=0):
+        calls.append(client.name)
+        raise _status_error(400)
+
+    monkeypatch.setattr(data_module, "generate_hidden_states", fake_generate)
+
+    result = arrow_ds[0]
+
+    assert isinstance(result, SampleUnavailable)
+    assert calls == ["http://a:8000/v1"]  # no cross-endpoint retry
+    assert arrow_ds.router.is_healthy("http://a:8000/v1")
+    assert arrow_ds.router.is_healthy("http://b:8000/v1")
+
+
+def test_all_endpoints_failing_yields_sample_unavailable(tmp_path, monkeypatch):
+    transfer = _SequenceTransfer([])
+    arrow_ds = _make_generation_dataset(
+        tmp_path,
+        transfer,
+        max_retries=0,
+        generation_validation_retries=0,
+    )
+    arrow_ds.router = EndpointRouter(
+        ["http://e1:8000/v1", "http://e2:8000/v1"],
+        client_factory=_EndpointClient,
+    )
+
+    def fake_generate(client, _model, _item, *, timeout=None, max_retries=0):
+        raise _connection_error(client.name)
+
+    monkeypatch.setattr(data_module, "generate_hidden_states", fake_generate)
+
+    result = arrow_ds[0]
+
+    assert isinstance(result, SampleUnavailable)
+    assert result.counts_as_failure
+    assert arrow_ds.router.stats("http://e1:8000/v1")["failures"] == 1
+    assert arrow_ds.router.stats("http://e2:8000/v1")["failures"] == 0

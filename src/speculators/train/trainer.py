@@ -38,6 +38,21 @@ from speculators.train.optimizers import build_optimizers
 from speculators.train.recovery import BatchRecoveryCoordinator
 from speculators.train.utils import normalize_counted_metrics
 
+
+def _allocated_memory_mb() -> float:
+    """Currently allocated device memory in MB.
+
+    torch_npu's allocator is not registered with torch>=2.7's unified
+    accelerator memory API, so ``torch.accelerator.memory_allocated()`` raises
+    "Allocator for npu is not a DeviceAllocator" on Ascend NPU. Fall back to
+    the backend-specific module (e.g. ``torch.npu.memory_allocated``).
+    """
+    try:
+        return torch.accelerator.memory_allocated() / (1024**2)
+    except (RuntimeError, AssertionError):
+        device = torch.accelerator.current_accelerator()
+        return getattr(torch, device.type).memory_allocated() / (1024**2)
+
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
@@ -80,7 +95,7 @@ class _StepTimer:
             torch.accelerator.synchronize()
             self._marks[name] = time.perf_counter()
             if torch.accelerator.is_available():
-                self._memory[name] = torch.accelerator.memory_allocated() / (1024**2)
+                self._memory[name] = _allocated_memory_mb()
 
     def mark_value(self, name: str, value: float) -> None:
         if self.enabled:

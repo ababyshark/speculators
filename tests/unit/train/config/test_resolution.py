@@ -102,6 +102,46 @@ def test_from_sources_rejects_draft_init_conflict():
         )
 
 
+def test_from_sources_rejects_endpoint_conflict():
+    with pytest.raises(ConfigError, match="mutually exclusive"):
+        TrainConfig.from_sources(
+            cli={
+                "verifier_name_or_path": "m",
+                "vllm_endpoint": "http://a:8000/v1",
+                "vllm_endpoints": ["http://a:8000/v1", "http://b:8000/v1"],
+            },
+            argv=["train.py"],
+        )
+
+
+def test_from_sources_accepts_endpoints_alone():
+    cfg = TrainConfig.from_sources(
+        cli={
+            "verifier_name_or_path": "m",
+            "vllm_endpoints": [
+                "http://a:8000/v1",
+                "http://b:8000/v1",
+                "http://a:8000/v1",
+            ],
+        },
+        argv=["train.py"],
+    )
+    flat = cfg.flatten()
+    assert flat["vllm_endpoints"] == ["http://a:8000/v1", "http://b:8000/v1"]
+    assert flat["vllm_endpoint"] == "http://localhost:8000/v1"  # default, unused
+
+
+def test_from_sources_endpoint_default_is_empty_list():
+    cfg = TrainConfig.from_sources(
+        cli={
+            "verifier_name_or_path": "m",
+            "vllm_endpoint": "http://a:8000/v1",
+        },
+        argv=["train.py"],
+    )
+    assert cfg.flatten()["vllm_endpoints"] == []
+
+
 # --------------------------------------------------------------------------- #
 # from_sources: the YAML layer and full flag > yaml > default precedence
 # --------------------------------------------------------------------------- #

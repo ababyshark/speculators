@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -16,6 +17,12 @@ from torch.distributed import ProcessGroup
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 logger = logging.getLogger("speculators")
+
+# Default init_process_group timeout. Multi-node rendezvous plus model loading
+# can exceed the torch default (10 min for nccl/hccl), so the default is raised
+# and made configurable via SPECULATORS_DIST_TIMEOUT_MINUTES (Megatron-style
+# --distributed-timeout-minutes).
+DEFAULT_DIST_TIMEOUT_MINUTES = 30.0
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -128,7 +135,9 @@ def _init_sp_process_groups(rank: int, world_size: int, sp_size: int) -> None:
     _dp_rank = rank // sp_size
 
 
-def maybe_setup_distributed(sp_size: int = 1) -> None:
+def maybe_setup_distributed(
+    sp_size: int = 1, timeout_minutes: float | None = None
+) -> None:
     """Set up distributed training if launched with ``torchrun``.
 
     Always populates the module-level topology state so that callers
@@ -136,6 +145,12 @@ def maybe_setup_distributed(sp_size: int = 1) -> None:
     Process groups are always created when distributed — with
     ``sp_size == 1`` the DP group spans all ranks and each SP group
     contains a single rank.
+
+    ``timeout_minutes`` bounds the process-group init and collective waits;
+    when unset it falls back to ``SPECULATORS_DIST_TIMEOUT_MINUTES`` then
+    :data:`DEFAULT_DIST_TIMEOUT_MINUTES`. Multi-node launches should raise it
+    if nodes start at very different times (slow image load, NCCL/HCCL
+    bootstrap).
     """
     global _local_rank, _rank, _is_distributed, _world_size  # noqa: PLW0603
 
@@ -148,12 +163,23 @@ def maybe_setup_distributed(sp_size: int = 1) -> None:
     if not distributed:
         return
 
+    if timeout_minutes is None:
+        timeout_minutes = float(
+            os.environ.get(
+                "SPECULATORS_DIST_TIMEOUT_MINUTES", DEFAULT_DIST_TIMEOUT_MINUTES
+            )
+        )
+
     torch.accelerator.set_device_index(local_rank)
     acc = torch.accelerator.current_accelerator()
     if acc is None:
         raise ValueError("No accelerator found")
     backend = torch.distributed.get_default_backend_for_device(acc)
-    dist.init_process_group(backend, device_id=local_rank)
+    dist.init_process_group(
+        backend,
+        device_id=local_rank,
+        timeout=timedelta(minutes=timeout_minutes),
+    )
 
     _rank = dist.get_rank()
     _world_size = dist.get_world_size()

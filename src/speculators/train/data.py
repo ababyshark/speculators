@@ -1,4 +1,5 @@
 import logging
+import time
 import warnings
 from collections.abc import Callable, Sequence
 from os import PathLike
@@ -11,11 +12,13 @@ from datasets import load_from_disk
 from torch.utils.data import Dataset
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
+from speculators.data_generation.endpoint_router import EndpointRouter
 from speculators.data_generation.offline import check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
     ClientItem,
+    InvalidResponseError,
     generate_hidden_states,
 )
 from speculators.train.recovery import (
@@ -27,6 +30,17 @@ from speculators.train.recovery import (
 
 BatchType = dict[str, Any]
 logger = logging.getLogger("speculators")
+
+DEFAULT_VLLM_ENDPOINT = "http://localhost:8000/v1"
+
+# Server-side failure modes worth failing over to another endpoint for.
+# Connection errors and timeouts are covered by openai's exception hierarchy;
+# these status codes are additionally treated as endpoint-scoped faults.
+FAILOVER_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
+
+# Backoff ceiling for retries that reuse the same endpoint (dead-end fallback
+# when every endpoint is in cooldown). Mirrors vllm_client.RETRY_BACKOFF_BASE.
+SAME_ENDPOINT_BACKOFF_CAP = 8
 
 
 def create_empty_sample(
@@ -150,7 +164,8 @@ class ArrowDataset(BaseDataset):
         max_len: int,
         datapath: str | PathLike,
         transfer: HiddenStatesTransfer | None = None,
-        vllm_endpoint: str = "http://localhost:8000/v1",
+        vllm_endpoint: str = DEFAULT_VLLM_ENDPOINT,
+        vllm_endpoints: Sequence[str] | None = None,
         on_missing: Literal["generate", "skip", "warn", "raise"] = "generate",
         train_ratio: float = 1.0,
         split: Literal["train", "val"] = "train",
@@ -160,6 +175,7 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         generation_validation_retries: int = 2,
         max_consecutive_generation_failures: int = 20,
+        router: EndpointRouter | None = None,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -182,9 +198,8 @@ class ArrowDataset(BaseDataset):
         self.data = self.data.select(range(start, stop))
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
-        self.vllm_endpoint = vllm_endpoint
         self.on_missing = on_missing
-        self.client: openai.OpenAI | None = None
+        self._requested_model = model
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
@@ -193,29 +208,20 @@ class ArrowDataset(BaseDataset):
             max_consecutive_failures=max_consecutive_generation_failures,
         )
 
+        if router is not None:
+            self.router = router
+        else:
+            endpoints = (
+                list(vllm_endpoints)
+                if vllm_endpoints
+                else [vllm_endpoint or DEFAULT_VLLM_ENDPOINT]
+            )
+            self.router = EndpointRouter(endpoints)
+        self._endpoints_ready = False
+        self._validated_endpoints: set[str] = set()
+
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, hidden_states_dtype)
-
-    def _map_to_file_idx(self, index: int):
-        return index + self.start_file_idx
-
-    def _setup_client(self):
-        client = openai.OpenAI(
-            base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
-        )
-        list_models = client.models.list()
-        model_id = list_models.data[0].id
-        if self.model and self.model != model_id:
-            raise ValueError(
-                f"An explicit model name was passed ({self.model}) which doesn't match"
-                f" found model_id {model_id}."
-                "Please make sure --endpoint is set to the correct vllm instance."
-            )
-        self.model = model_id
-        self.transfer.setup()
-        # Do not retain a half-initialized client if model discovery or Mooncake
-        # setup failed; the outer full-round-trip retry should redo initialization.
-        self.client = client
 
     def __len__(self):
         return len(self.data)
@@ -224,6 +230,128 @@ class ArrowDataset(BaseDataset):
         """Get lengths of the dataset samples."""
         return list(self.data.with_format(None)["seq_len"])
 
+    def _map_to_file_idx(self, index: int):
+        return index + self.start_file_idx
+
+    def _setup_endpoints(self) -> None:
+        """First-use initialization: transfer setup + model discovery per endpoint.
+
+        Every endpoint gets a model-id probe so a misrouted endpoint (serving a
+        different model) is evicted before it poisons a sample. Discovery or
+        transfer failures leave ``_endpoints_ready`` False so the outer
+        full-round-trip retry (``GenerationRecoveryGuard``) redoes
+        initialization.
+        """
+        self.transfer.setup()
+
+        discovery_errors: list[str] = []
+        for endpoint in self.router.endpoints:
+            client = self.router.client_for(endpoint)
+            try:
+                model_id = client.models.list().data[0].id
+            except Exception as error:  # noqa: BLE001 - endpoint-scoped fault
+                self.router.report_failure(endpoint)
+                discovery_errors.append(f"{endpoint}: {type(error).__name__}: {error}")
+                logger.warning(
+                    "Model discovery failed for vLLM endpoint %s: %s: %s",
+                    endpoint,
+                    type(error).__name__,
+                    error,
+                )
+                continue
+
+            if self.model is None:
+                self.model = model_id
+            if model_id != self.model:
+                self.router.evict(endpoint)
+                discovery_errors.append(
+                    f"{endpoint}: serves model '{model_id}', expected '{self.model}'"
+                )
+                logger.error(
+                    "vLLM endpoint %s serves model '%s' but expected '%s'; "
+                    "evicted from routing",
+                    endpoint,
+                    model_id,
+                    self.model,
+                )
+                continue
+            self._validated_endpoints.add(endpoint)
+
+        if not self._validated_endpoints:
+            detail = "; ".join(discovery_errors) or "no endpoints configured"
+            raise RuntimeError(
+                "No usable vLLM endpoint for hidden-state generation. "
+                f"Endpoint probe results: {detail}"
+            )
+        # Do not retain half-initialized state if any later step fails; the
+        # outer full-round-trip retry should redo initialization.
+        self._endpoints_ready = True
+
+    def _generate_with_failover(
+        self,
+        client_item: ClientItem,
+    ) -> tuple[str, dict[str, Any]]:
+        """Attempt one generation, failing over between healthy endpoints.
+
+        Retry budget is ``max_retries + 1`` attempts, redistributed across
+        endpoints: connection-level failures rotate to the next healthy
+        endpoint without backoff, while a repeat pick of the same endpoint
+        (dead-end fallback when everything is in cooldown) backs off like the
+        single-endpoint path did. Model/transfer-level failures are not
+        endpoint faults and propagate immediately.
+        """
+        attempts = self.max_retries + 1
+        last_error: Exception | None = None
+        previous_endpoint: str | None = None
+        for attempt in range(attempts):
+            client, endpoint = self.router.pick()
+            if previous_endpoint == endpoint and attempt > 0:
+                time.sleep(min(2**attempt, SAME_ENDPOINT_BACKOFF_CAP))
+            previous_endpoint = endpoint
+            try:
+                handle, hs_transfer_params = generate_hidden_states(
+                    client,
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    max_retries=0,  # retries are handled here, across endpoints
+                )
+            except InvalidResponseError:
+                # The endpoint answered; content validation is not its fault.
+                self.router.report_success(endpoint)
+                raise
+            except openai.APIStatusError as error:
+                if error.status_code in FAILOVER_STATUS_CODES:
+                    # Endpoint-scoped server fault: evict path, fail over.
+                    self.router.report_failure(endpoint)
+                    last_error = error
+                    logger.warning(
+                        "vLLM endpoint %s returned status %d; failing over",
+                        endpoint,
+                        error.status_code,
+                    )
+                else:
+                    # Semantic error (bad request, auth, ...): the same
+                    # request would fail on any endpoint, so don't poison
+                    # endpoint health -- fail fast.
+                    self.router.report_success(endpoint)
+                    raise
+            except openai.APIConnectionError as error:
+                # Includes APITimeoutError.
+                self.router.report_failure(endpoint)
+                last_error = error
+                logger.warning(
+                    "vLLM endpoint %s connection failure; failing over: %s",
+                    endpoint,
+                    error,
+                )
+            else:
+                self.router.report_success(endpoint)
+                return handle, hs_transfer_params
+        if last_error is None:  # pragma: no cover - loop guarantees one record
+            raise RuntimeError("Endpoint failover exhausted without an error")
+        raise last_error
+
     def _generate_hidden_states_once(
         self,
         dataset_item: dict,
@@ -231,15 +359,9 @@ class ArrowDataset(BaseDataset):
     ) -> dict[str, torch.Tensor]:
         handle: str | None = None
         try:
-            if not self.client:
-                self._setup_client()
-            handle, hs_transfer_params = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
-            )
+            if not self._endpoints_ready:
+                self._setup_endpoints()
+            handle, hs_transfer_params = self._generate_with_failover(client_item)
 
             loaded_hs = self.transfer.get_generated(hs_transfer_params)
             if loaded_hs is None:

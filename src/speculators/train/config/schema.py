@@ -259,7 +259,16 @@ class GenerationArgs(_Group):
         default="http://localhost:8000/v1",
         description="vLLM endpoint used to generate hidden states on demand. Only "
         "needed if --on-missing=generate and samples are missing. The vLLM instance "
-        "must cache hidden states to a location reachable from the training instance.",
+        "must cache hidden states to a location reachable from the training instance. "
+        "Mutually exclusive with --vllm-endpoints.",
+    )
+    vllm_endpoints: list[str] = Field(
+        default_factory=list,
+        description="vLLM endpoints to load-balance hidden-state generation across "
+        "(round-robin with failure eviction). Only needed if --on-missing=generate "
+        "and samples are missing. All endpoints must serve the same model and share "
+        "one hidden-states store (same --mooncake-master or shared filesystem). "
+        "Mutually exclusive with --vllm-endpoint.",
     )
     on_missing: Literal["generate", "skip", "warn", "raise"] = Field(
         default="generate",

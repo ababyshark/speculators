@@ -394,6 +394,23 @@ def _warn_deprecated(provided: set[str]) -> None:
         )
 
 
+def _validate_generation_endpoints(cfg: TrainConfig, provided: set[str]) -> None:
+    """Enforce single/multi-endpoint mutual exclusion and dedupe the list."""
+    if "vllm_endpoints" in provided and "vllm_endpoint" in provided:
+        raise ConfigError(
+            "--vllm-endpoint and --vllm-endpoints are mutually exclusive: pass a "
+            "single --vllm-endpoint, or a list of --vllm-endpoints to load-balance"
+        )
+    if cfg.generation.vllm_endpoints:
+        seen: set[str] = set()
+        unique = []
+        for endpoint in cfg.generation.vllm_endpoints:
+            if endpoint not in seen:
+                seen.add(endpoint)
+                unique.append(endpoint)
+        cfg.generation.vllm_endpoints = unique
+
+
 def build_from_sources(
     cls: type[TrainConfig],
     *,
@@ -453,6 +470,7 @@ def build_from_sources(
     provided = {dest for dest, layer in cfg._provenance.items() if layer != "default"}
     _warn_mismatched_algorithm_blocks(cfg, provided)
     _warn_deprecated(provided)
+    _validate_generation_endpoints(cfg, provided)
     _validate_draft_init(cfg, provided)
     _validate_required(cfg)
     return cfg
