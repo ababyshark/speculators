@@ -69,17 +69,30 @@ def _setup_dataloader(
     max_batches: int | None = None,
     seed: int = 0,
 ) -> DataLoader:
-    batch_sampler = MultipackDistributedBatchSamplerV2(
-        batch_max_length=total_seq_len,
-        lengths=dataset.approx_lengths,
-        num_replicas=get_dp_size(),
-        rank=get_dp_rank(),
-        seed=seed,
-        max_batches=max_batches,
-    )
+    if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
+        class _SingleSampleSampler:
+            def __iter__(self):
+                indices = list(range(get_dp_rank(), len(dataset), get_dp_size()))
+                if max_batches is not None:
+                    indices = indices[:max_batches]
+                return iter(([i] for i in indices))
+            def __len__(self):
+                n = max(0, (len(dataset) - get_dp_rank() + get_dp_size() - 1) // get_dp_size())
+                return min(n, max_batches) if max_batches is not None else n
+        batch_sampler = _SingleSampleSampler()
+    else:
+        batch_sampler = MultipackDistributedBatchSamplerV2(
+            batch_max_length=total_seq_len,
+            lengths=dataset.approx_lengths,
+            num_replicas=get_dp_size(),
+            rank=get_dp_rank(),
+            seed=seed,
+            max_batches=max_batches,
+        )
     use_workers = num_workers > 0
     return DataLoader(
         dataset,
+        generator=torch.Generator().manual_seed(seed),
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if use_workers else None,
@@ -113,6 +126,7 @@ def create_train_val_loaders(
     max_train_batches: int | None = None,
     seed: int = 0,
     max_transfer_workers: int = 1,
+    max_val_batches: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -195,6 +209,7 @@ def create_train_val_loaders(
         total_seq_len,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
+        max_batches=max_val_batches,
     )
 
     return train_loader, val_loader

@@ -275,7 +275,9 @@ def test_distributed_mid_epoch_checkpoint_rank_gate(
     trained_steps: list[tuple[int, int, int]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rank-0 writes state/symlink while nonzero ranks skip side effects."""
+    """Only rank zero writes shared metadata; every rank saves its RNG."""
+    barriers = []
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
     with tempfile.TemporaryDirectory() as tmpdir:
         num_steps = len(_make_loader())
         step_interval = max(1, round(num_steps * 0.3))
@@ -300,6 +302,7 @@ def test_distributed_mid_epoch_checkpoint_rank_gate(
             trained_steps=rank1_steps,
         )
         rank1.is_distributed = True
+        rank1.rank = 1
         monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
         rank1.maybe_save_checkpoint(0, local_step=step_interval)
 
@@ -307,6 +310,8 @@ def test_distributed_mid_epoch_checkpoint_rank_gate(
         link_rank1 = Path(tmpdir) / f"epoch0_step{step_interval}"
         assert not state_rank1.exists()
         assert not link_rank1.exists()
+        assert (Path(tmpdir) / "0" / "rng_state_rank1.pt").exists()
+    assert len(barriers) == 2
 
 
 class _CountingDataset(Dataset):

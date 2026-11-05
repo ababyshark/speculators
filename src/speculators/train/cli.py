@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import json
 import logging
 import random
 import warnings
@@ -56,12 +57,17 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
 MROPE_INVERSE_TOLERANCE = 1e-6
 
 
-def set_seed(seed: int, deterministic: bool = False):
+def set_seed(
+    seed: int, deterministic: bool = False, deterministic_algorithms: bool = False
+):
     """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    if deterministic_algorithms:
+        torch.use_deterministic_algorithms(True)
 
     if deterministic:
         # For deterministic behavior (may impact performance)
@@ -550,12 +556,14 @@ def build_draft_model(
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
+                dtype=torch.float32,
                 t2d=t2d,
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
             )
         return model_class.from_pretrained(
             args.from_pretrained,
+            dtype=torch.float32,
             t2d=t2d,
             d2t=d2t,
             verifier=args.verifier_name_or_path,
@@ -623,7 +631,7 @@ def main(cfg: TrainConfig):  # noqa: C901
     args = argparse.Namespace(**cfg.flatten())
 
     # Set random seed for reproducibility
-    set_seed(args.seed, args.deterministic_cuda)
+    set_seed(args.seed, args.deterministic_cuda, args.deterministic_algorithms)
 
     # Setup logging
     setup_root_logger()
@@ -653,8 +661,11 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Write the reproducibility artifacts (run.yaml + train_command.txt) next to
     # the checkpoints at rank 0 only, so every checkpoint carries the resolved
     # config that produced it.
+    provenance_path = (
+        Path(args.save_path) / "evaluation" if args.eval_only else Path(args.save_path)
+    )
     if get_rank() == 0:
-        cfg.save(args.save_path)
+        cfg.save(provenance_path)
 
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
 
@@ -757,6 +768,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         max_transfer_workers=args.max_transfer_workers,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        max_val_batches=args.max_val_batches,
         seed=args.seed,
     )
 
@@ -790,11 +802,19 @@ def main(cfg: TrainConfig):  # noqa: C901
         fsdp_shard=args.fsdp_shard,
         gradient_checkpointing=args.gradient_checkpointing,
         max_steps=args.max_steps,
+        eval_before_train=args.eval_before_train,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
-    # Run training
-    trainer.run_training()
+    # Evaluation shares checkpoint loading and the online data path with training.
+    if args.eval_only:
+        metrics = trainer.val_epoch(trainer.current_epoch)
+        if get_rank() == 0:
+            (provenance_path / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        if trainer.checkpointer.previous_epoch != -1:
+            trainer.maybe_update_best(trainer.checkpointer.previous_epoch, metrics)
+    else:
+        trainer.run_training()
 
     # Cleanup
     del trainer, draft_model

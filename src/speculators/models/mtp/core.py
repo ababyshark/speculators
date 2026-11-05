@@ -240,6 +240,11 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         self.verifier_norm.weight.requires_grad = False
 
+        if tc.model_type == "glm_moe_dsa":
+            self._keep_in_fp32_modules_strict = {
+                "input_layernorm", "post_attention_layernorm", "q_a_layernorm",
+                "kv_a_layernorm", "k_norm", "e_score_correction_bias",
+            }
         self.post_init()
 
     @property
@@ -256,6 +261,12 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         """Re-set NaN sentinel before loading — meta-device init may clear
         it. Deletes verifier_lm_head after loading since MTP does not use it.
         """
+        if self.config.transformer_layer_config.model_type == "glm_moe_dsa":
+            if not self.config.mtp_shared_weights_path:
+                raise ValueError("GLM requires its independent MTP shared weights")
+            from speculators.models.mtp.glm_mtp import load_native_shared_weights
+            load_native_shared_weights(self)
+            return
         with torch.no_grad():
             self.embed_tokens.weight.fill_(torch.nan)
             self.lm_head.weight.fill_(torch.nan)
@@ -392,6 +403,20 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             (lengths, verifier_last_hidden_states)
         :return: Tuple of (logits_list, loss, metrics)
         """
+        if self.config.transformer_layer_config.model_type == "glm_moe_dsa":
+            from speculators.models.mtp.glm_mtp import forward_glm_single_step
+            return forward_glm_single_step(
+                self, input_ids, hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, loss_mask=loss_mask,
+                step_weights=step_weights, **kwargs,
+            )
+        if self.config.transformer_layer_config.model_type == "glm_moe_dsa":
+            from speculators.models.mtp.glm_mtp import forward_glm_mtp
+            return forward_glm_mtp(
+                self, input_ids, hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, loss_mask=loss_mask,
+                step_weights=step_weights, **kwargs,
+            )
         input_ids = input_ids.long()
         device = input_ids.device
         batch_size, seq_len = input_ids.shape

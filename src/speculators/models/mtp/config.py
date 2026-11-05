@@ -43,6 +43,10 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    mtp_shared_weights_path: str | None = Field(
+        default=None, description="Native MTP checkpoint containing independent frozen vocab weights"
+    )
+
     num_nextn_predict_layers: int = Field(
         default=1,
         description=(

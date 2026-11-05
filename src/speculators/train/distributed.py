@@ -203,12 +203,27 @@ def apply_fully_sharded(
     Model should be validated with SpeculatorModel.verify_training_compatible()
     before calling this function.
     """
+    # Keep FP32 gradient reduction by default. Large GLM-MTP pilots can
+    # opt into bf16 reduction via an explicit environment override.
+    reduce_name = os.environ.get("SPECULATORS_FSDP_REDUCE_DTYPE", "float32")
+    if reduce_name not in {"float32", "bfloat16"}:
+        raise ValueError(
+            "SPECULATORS_FSDP_REDUCE_DTYPE must be float32 or bfloat16"
+        )
+    reduce_dtype = torch.bfloat16 if reduce_name == "bfloat16" else torch.float32
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
-        reduce_dtype=torch.float32,
+        reduce_dtype=reduce_dtype,
     )
 
+    # GLM native MTP has one very large sparse-MoE layer. Shard attention,
+    # router, shared expert and each routed expert before the enclosing layer.
+    model_type = getattr(getattr(model.config, "transformer_layer_config", None), "model_type", None)
     for layer in model.layers:  # type: ignore[union-attr]
+        if model_type == "glm_moe_dsa":
+            children = [layer.self_attn, layer.mlp.gate, layer.mlp.shared_experts, *layer.mlp.experts]
+            for child in children:
+                fully_shard(child, mp_policy=mp_policy)
         fully_shard(layer, mp_policy=mp_policy)
 
     fully_shard(model, mp_policy=mp_policy)

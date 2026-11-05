@@ -209,6 +209,12 @@ class DataArgs(_Group):
     total_seq_len: int = Field(
         default=8192, description="Maximum training sequence length, in tokens."
     )
+    max_val_batches: int | None = Field(
+        default=None,
+        gt=0,
+        description="Limit validation packed batches for a bounded smoke run; "
+        "omit for full validation.",
+    )
     train_data_ratio: float = Field(
         default=0.9,
         description="Fraction of the dataset used for training; the remainder is held "
@@ -429,6 +435,10 @@ class TrainerArgs(_Group):
         description="Enable gradient checkpointing on decoder layers to save "
         "activation memory at the cost of ~30-50 percent slower backward. "
         "Recommended for 32K+ sequence lengths or large max_anchors.",
+    )
+    eval_before_train: bool = Field(
+        default=False,
+        description="Evaluate the initial model before the first optimizer step.",
     )
     max_steps: int | None = Field(
         default=None,
@@ -748,6 +758,11 @@ class TrainConfig(BaseSettings):
         description="Type of speculator model to train "
         "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp).",
     )
+    eval_only: bool = Field(
+        default=False,
+        description="Load the selected checkpoint and evaluate without optimizer steps. "
+        "Write metrics and provenance under save-path/evaluation.",
+    )
     dry_run: bool = Field(
         default=False,
         description="Build the speculator, initialize weights, save a checkpoint to "
@@ -756,6 +771,11 @@ class TrainConfig(BaseSettings):
         "or --from-pretrained.",
     )
     seed: int = Field(default=42, description="Random seed for reproducibility.")
+    deterministic_algorithms: bool = Field(
+        default=False,
+        description="Require deterministic PyTorch algorithms, including accelerator "
+        "backward operations. Unsupported operations raise an error.",
+    )
     deterministic_cuda: bool = Field(
         default=False,
         description="Set cuda to deterministic mode. This may impact performance.",

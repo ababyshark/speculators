@@ -149,7 +149,14 @@ Qwen3MTPLayer = _create_mtp_layer_class(
     "Qwen3MTPLayer", Qwen3DecoderLayer, Qwen3RMSNorm
 )
 
+from speculators.models.mtp.glm_mtp import (
+    GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding,
+)
+
 mtp_model_classes: dict[str, base_components.ModelComponents] = {
+    "glm_moe_dsa": base_components.ModelComponents(
+        GlmMTPLayer, GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding
+    ),
     "qwen3": base_components.override_components(
         "qwen3", first_layer_class=Qwen3MTPLayer
     ),
