@@ -61,7 +61,7 @@ grep -q "_VocabCE" $BASE/../my-contributions/speculators/src/speculators/models/
 grep -q 'down_proj.requires_grad_(False)' $BASE/../my-contributions/speculators/src/speculators/train/cli.py 2>/dev/null \
   && pass "experts-freeze present in cli" || fail "experts freeze missing in cli.py"
 grep -q 'data_prep_rot' $BASE/run_pipeline_v2.sh && pass "pipeline uses rot data" || fail "pipeline --data-path does not point at data_prep_rot"
-grep -qE 'hybrids/v8-w4a8' $BASE/run_pipeline_v2.sh && pass "eval model matches requant output" || fail "eval --model mismatch (404 bug)"
+grep -qE 'vllm serve \$M|--model \$SAVE_PATH-w4a8' $BASE/run_pipeline_v2.sh && pass "eval model matches requant output" || fail "eval --model mismatch (404 bug)"
 
 echo "=== [5] model + warm-start"
 [ -f "$MODEL/config.json" ] && [ -f "$MODEL/rot.safetensors" ] && pass "model dir + rot.safetensors present" || fail "model dir incomplete"
