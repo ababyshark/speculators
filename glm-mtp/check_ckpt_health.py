@@ -2,7 +2,6 @@
 confirm weights changed vs warm-start, and probe a forward on CPU."""
 
 import json
-import sys
 
 import torch
 from safetensors import safe_open

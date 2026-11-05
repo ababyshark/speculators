@@ -270,6 +270,13 @@ select = [
 "src/speculators/convert/**/*.py" = [
     "BLE001", # allow catching Exception for conversion errors
 ]
+"glm-mtp/**/*.py" = [
+    # deployment kit: the operational scripts mirror examples/glm53_mtp
+    "PTH123", "PTH208", "SIM115", "SIM118", "C901", "T201", "E402", "S110",
+    "BLE001", "RET504", "F841", "PLC0415", "E501", "ASYNC230", "ASYNC240",
+    "PLW0127", "B007", "E741", "ASYNC210", "PIE810", "PLR1714", "S101",
+    "PTH211",
+]
 "examples/glm53_mtp/**/*.py" = [
     "PTH123", # operational scripts use builtin open() for NFS path portability
     "PTH208", # dir listing via os.listdir is fine for one-shot scripts

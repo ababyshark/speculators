@@ -7,7 +7,6 @@ report argmax agreement with the actual next token (from token_ids) and with
 each other.
 """
 
-import json
 import sys
 
 import torch
@@ -23,13 +22,12 @@ MODEL = "/mnt/weight2/l00840580-glm53-w4a8-biasfix"
 
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaDecoderLayer,
-    GlmMoeDsaRMSNorm,
     GlmMoeDsaRotaryEmbedding,
 )
 
 
 def load_layer(path):
-    import glob, os
+    import glob
 
     sd = {}
     files = sorted(glob.glob(f"{path}/model*.safetensors"))
@@ -43,17 +41,12 @@ def load_layer(path):
 
 def build_mtp(sd, config, dtype=torch.bfloat16, device="npu:0"):
     """Minimal MTP module from the drafter state dict (HF GlmMoeDsa form)."""
-    import torch.nn as nn
+    from torch import nn
 
     class Attn(nn.Module):
         pass
 
     # assemble via GlmMoeDsa modeling: use the decoder layer class directly
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-        GlmMoeDsaDecoderLayer,
-        GlmMoeDsaRMSNorm,
-        GlmMoeDsaRotaryEmbedding,
-    )
 
     import copy
 

@@ -12,13 +12,12 @@ Usage: bf16_export.py --drafter <ckpt_dir> --model <biasfix> --output <dir>
 
 import argparse
 import glob
-import json
 import shutil
 from pathlib import Path
 
+import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-import torch
 
 # speculators drafter key -> native layer-78 key
 REMAP = {
