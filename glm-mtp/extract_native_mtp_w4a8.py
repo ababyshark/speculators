@@ -103,7 +103,7 @@ def main():
         ):
             continue  # consumed by the weight dequant or dropped
         if t.dtype.is_floating_point:
-            tensors[base] = t.contiguous()
+            tensors[k] = t.contiguous()
             stats["float"] += 1
         elif t.dtype == torch.int8:
             scale_k = k.rsplit(".", 1)[0] + ".weight_scale"
@@ -123,14 +123,14 @@ def main():
             ):  # int4 packed
                 if bias is None:
                     bias = torch.ones_like(scale)  # no-op subtraction
-                tensors[base] = dequant_expert_weight(t, scale, args.zero_point_mode, bias).contiguous()
+                tensors[k] = dequant_expert_weight(t, scale, args.zero_point_mode, bias).contiguous()
                 stats["int4"] += 1
             else:
                 w = dequant_tensor(t, scale)
-                tensors[base] = w.contiguous()
+                tensors[k] = w.contiguous()
                 stats["int8"] += 1
         else:
-            tensors[base] = t.contiguous()
+            tensors[k] = t.contiguous()
             stats["other"] += 1
 
     print(f"extracted stats: {stats} | total {len(tensors)}")
