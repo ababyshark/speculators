@@ -1,0 +1,7 @@
+{
+  "status": "passed",
+  "loaded_tensors": 793,
+  "synthetic_short_loss": 11.775090217590332,
+  "seconds": 5.514482896309346,
+  "peak_allocated_gib": 22.117874145507812
+}

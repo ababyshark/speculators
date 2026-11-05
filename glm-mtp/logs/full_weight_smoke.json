@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "loaded_tensors_bitwise_exact": 793,
+  "synthetic_short_loss": 11.85857105255127,
+  "seconds": 27.407457780092955,
+  "peak_allocated_gib": 22.117874145507812,
+  "native_parity": "NOT_YET_VALIDATED"
+}
