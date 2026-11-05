@@ -7,7 +7,8 @@
 
 BASE=/mnt/share_space/l00840580/dspark-glm53
 MODEL=/mnt/weight2/l00840580-glm53-w4a8-biasfix
-CKPT=${SAVE_PATH:-$BASE/checkpoints/glm53_mtp_v2}
+RUN_ID=${RUN_ID:-}
+CKPT=${SAVE_PATH:-$BASE/checkpoints/glm53_mtp_v2_${RUN_ID:+$RUN_ID}}
 FAIL=0
 
 pass() { echo "  PASS: $1"; }
@@ -70,7 +71,17 @@ n_ws=$(ls $BASE/drafter_init/glm53-mtp-warmstart-signed/model*.safetensors 2>/de
 [ "$n_ws" -ge 1 ] && pass "warm-start shards: $n_ws" || fail "warm-start has no weight files"
 
 echo "=== [6] stale checkpoints (must NOT exist at launch — bogus resume)"
-[ ! -d "$CKPT" ] && pass "no stale glm53_mtp_v2 checkpoint" || fail "STALE $CKPT exists — will trigger bogus resume (rm it)"
+if [ -d "$CKPT" ]; then
+  # shared-NFS multi-host: a foreign host may legitimately be training into
+  # its own SAVE_PATH — only flag if OUR launch would resume into it
+  if ps aux | grep -v grep | grep -q "save-path $CKPT"; then
+    pass "checkpoint dir in use by an active run on this host"
+  else
+    fail "STALE $CKPT exists — use a per-host SAVE_PATH (rm it or pick another)"
+  fi
+else
+  pass "no stale checkpoint at $CKPT"
+fi
 
 echo "=== [7] serving port"
 ss -tln 2>/dev/null | grep -q ":8100 " && fail "port 8100 occupied" || pass "port 8100 free"

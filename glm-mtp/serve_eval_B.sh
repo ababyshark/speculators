@@ -18,5 +18,5 @@ nohup vllm serve $MODEL \
   --max-num-seqs 32 --trust-remote-code --quantization ascend \
   --enable-expert-parallel --gpu-memory-utilization 0.90 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":5,"enforce_eager":true}' \
-  > $LOG_DIR/serve_eval_B_trained.log 2>&1 &
+  > $LOG_DIR/serve_eval_B_${SERVE_LOG_SUFFIX:-manual}.log 2>&1 &
 echo "PID: $!"
