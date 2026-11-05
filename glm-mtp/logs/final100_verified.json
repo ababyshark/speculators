@@ -1,0 +1,36 @@
+{
+  "status": "verified_model_written_before_shutdown_failure",
+  "run": "/data1/mtp_training/runs/glm53_mtp_formal100_8k",
+  "checkpoint_model": "/data1/mtp_training/runs/glm53_mtp_formal100_8k/checkpoints/0/model.safetensors",
+  "effective_updates": 100,
+  "last_logged_global_step": 99,
+  "last_train_loss": 0.38,
+  "final_validation_loss": 0.369,
+  "parameter_audit": {
+    "changed_tensors": 785,
+    "changed_elements": 9943472853,
+    "max_abs_delta": 0.00030710414284840226
+  },
+  "checkpoint_smoke": {
+    "status": "passed",
+    "loaded_tensors": 793,
+    "synthetic_short_loss": 11.775090217590332,
+    "seconds": 5.514482896309346,
+    "peak_allocated_gib": 22.117874145507812
+  },
+  "export_report_keys": [
+    "passed",
+    "checkpoint",
+    "native_source",
+    "target_model",
+    "layer",
+    "trained_tensor_count",
+    "shared_tensor_count",
+    "weight_map_count",
+    "weight_storage",
+    "shared_records",
+    "trained_records"
+  ],
+  "shutdown_note": "SIGBUS occurred during distributed shutdown after validation and model shard write; stale training_state.json remains at step20.",
+  "not_claimed": "optimizer/RNG metadata resume from step100 was not written by the failed shutdown."
+}

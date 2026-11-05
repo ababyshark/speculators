@@ -1,12 +1,19 @@
 """GLM native MTP components; single-step training is the initial contract."""
 import copy
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-    GlmMoeDsaAttention, GlmMoeDsaIndexer, GlmMoeDsaMLP, GlmMoeDsaRMSNorm,
-    GlmMoeDsaRotaryEmbedding, GlmMoeDsaTopkRouter, apply_rotary_pos_emb_interleave,
+    GlmMoeDsaAttention,
+    GlmMoeDsaIndexer,
+    GlmMoeDsaMLP,
+    GlmMoeDsaRMSNorm,
+    GlmMoeDsaRotaryEmbedding,
+    GlmMoeDsaTopkRouter,
+    apply_rotary_pos_emb_interleave,
 )
+
 
 class GlmMTPRMSNorm(GlmMoeDsaRMSNorm):
     def forward(self, hidden_states):
@@ -78,7 +85,7 @@ class GlmMTPLayer(nn.Module):
         hidden=hidden+attention; hidden=hidden+self.mlp(self.post_attention_layernorm(hidden)); return self.final_layernorm(hidden)
 
 def native_key_to_training(key, layer_index=78):
-    prefix=f"model.layers.{layer_index}."; 
+    prefix=f"model.layers.{layer_index}."
     if not key.startswith(prefix): raise ValueError(f"Not a native MTP tensor: {key}")
     key=key[len(prefix):]
     if key=="embed_tokens.weight": return "embed_tokens.weight"
@@ -90,6 +97,7 @@ def native_key_to_training(key, layer_index=78):
 def load_native_shared_weights(model):
     import json
     from pathlib import Path
+
     from safetensors import safe_open
     path=Path(model.config.mtp_shared_weights_path); index=json.loads((path/"model.safetensors.index.json").read_text())["weight_map"]
     layer_index=model.config.transformer_layer_config.num_hidden_layers

@@ -1,0 +1,9 @@
+# Timestamp: 2026-11-02T15:57:20.861205+00:00
+# Git SHA: 7ed657f8cd4a24c0cc53aa28866a289a278f5bc5
+# World size: 8
+# speculators: 0.10.0a28
+# vllm: 0.30.0+empty
+# transformers: 5.14.1
+# torch: 2.10.0+cpu
+# compressed-tensors: 0.17.0
+/workspace/speculators/src/speculators/train/__main__.py --speculator-type mtp --verifier-name-or-path /data1/weight/GLM-5.3-w4a8-spec --trust-remote-code --from-pretrained /data1/mtp_training/weights/glm53_mtp_speculators_step0 --data-path /data1/mtp_training/data/prepared_8k_dflash2_official --hidden-states-backend file --hidden-states-path /data1/mtp_training/online_hidden_states_formal100_8k --vllm-endpoint http://127.0.0.1:8000/v1 --on-missing generate --request-timeout 600 --max-retries 2 --generation-validation-retries 2 --max-consecutive-generation-failures 20 --hidden-states-lock-timeout 180 --total-seq-len 8192 --train-data-ratio 0.9005663797009516 --max-val-batches 1 --hidden-states-dtype bfloat16 --num-workers 0 --prefetch-factor 1 --max-transfer-workers 1 --num-speculative-steps 1 --optimizer adamw --optimizer-implementation eager --lr 1e-5 --weight-decay 0.1 --scheduler-type cosine --scheduler-warmup-steps 1 --scheduler-total-steps 100 --epochs 1 --checkpoint-freq 20 --save-best --save-path /data1/mtp_training/runs/glm53_mtp_formal100_8k/checkpoints --fsdp-shard --deterministic-algorithms --max-steps 100 --log-freq 1 --logger '' --log-dir /data1/mtp_training/runs/glm53_mtp_formal100_8k/logs --run-name glm53_mtp_formal100_8k

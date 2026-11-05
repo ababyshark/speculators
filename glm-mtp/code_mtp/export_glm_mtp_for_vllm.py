@@ -100,8 +100,8 @@ def main() -> None:
         }
     shared_name = "mtp_shared.safetensors"
     save_file(shared_tensors, str(out / shared_name))
-    weight_map = {nk: "model.safetensors" for nk in sorted(mapped)}
-    weight_map.update({nk: shared_name for nk in sorted(shared)})
+    weight_map = dict.fromkeys(sorted(mapped), "model.safetensors")
+    weight_map.update(dict.fromkeys(sorted(shared), shared_name))
     (out / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map}, indent=2) + "\n"
     )

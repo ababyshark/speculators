@@ -21,10 +21,8 @@ config.json + extraction_report.json) — consumed by convert_glm_mtp.py.
 """
 
 import argparse
-import glob
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -33,9 +31,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from speculators.convert.w4a8_layout import (  # noqa: E402
+from speculators.convert.w4a8_layout import (
     dequant_tensor,
-    unpack_int4_dim0,
 )
 
 

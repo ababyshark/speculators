@@ -1,0 +1,11 @@
+{
+  "status": "passed",
+  "indexer_chunk_exact": true,
+  "expert_forward_backward": true,
+  "first_position_mask": true,
+  "indexer_frozen": true,
+  "eps_and_rope": true,
+  "padding_loss_exact": true,
+  "packed_boundary_rejected": true,
+  "native_vllm_parity": "NOT_YET_VALIDATED"
+}
