@@ -276,6 +276,11 @@ select = [
     "BLE001", "RET504", "F841", "PLC0415", "E501", "ASYNC230", "ASYNC240",
     "PLW0127", "B007", "E741", "ASYNC210", "PIE810", "PLR1714", "S101",
     "PTH211",
+    "N806", # uppercase math variables (E/H/K) in dispatch-adjacent scripts
+    "INP001", # deployment kit scripts are not packages
+    "ARG001", # unused hook args kept for interface parity
+    "PTH207", # glob-style listing in one-shot scripts
+    "PLR2004", # quantization constants inline in operational scripts
 ]
 "examples/glm53_mtp/**/*.py" = [
     "PTH123", # operational scripts use builtin open() for NFS path portability
