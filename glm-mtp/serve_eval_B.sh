@@ -2,7 +2,7 @@
 # Eval serving A: baseline — native MTP from the W4A8 checkpoint itself, 5 tokens
 set -x
 cd /mnt/share_space/l00840580/dspark-glm53
-MODEL=${MODEL:-/mnt/share_space/l00840580/dspark-glm53/hybrids/v8-w4a8}
+MODEL=${MODEL:-/mnt/weight2/l00840580-glm53-w4a8-mtp5-trained}
 LOG_DIR=/mnt/share_space/l00840580/dspark-glm53/logs
 P1="VLLM:"; P2="EngineCor"; P3="entrypoints.cli.mai"
 pkill -9 -f "${P1}:" 2>/dev/null; pkill -9 -f "${P2}e" 2>/dev/null; pkill -9 -f "${P3}n" 2>/dev/null
