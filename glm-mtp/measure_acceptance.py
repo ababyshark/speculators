@@ -7,9 +7,9 @@ counters and reports per-position acceptance + mean accepted length.
 import argparse
 import asyncio
 import json
-from pathlib import Path
 import re
 import urllib.request
+from pathlib import Path
 
 import aiohttp
 
@@ -100,8 +100,6 @@ async def main():
             f"[{args.label}] overall accepted/draft = {total_accepted / total_draft if total_draft else 0:.4f}"
         )
         if args.save_json:
-            import os
-
             Path(args.save_json).parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "label": args.label,
