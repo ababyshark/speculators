@@ -7,7 +7,7 @@
 
 BASE=/mnt/share_space/l00840580/dspark-glm53
 MODEL=/mnt/weight2/l00840580-glm53-w4a8-biasfix
-CKPT=$BASE/checkpoints/glm53_mtp_v2
+CKPT=${SAVE_PATH:-$BASE/checkpoints/glm53_mtp_v2}
 FAIL=0
 
 pass() { echo "  PASS: $1"; }
