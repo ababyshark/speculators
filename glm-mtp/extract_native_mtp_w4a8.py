@@ -79,11 +79,18 @@ def main():
     # the W4A8 checkpoint carries per-weight quant metadata (scale/offset/
     # scale_bias); the extraction targets = the tensors themselves
     meta_suffixes = (".weight_scale", ".weight_offset", ".scale_bias")
-    target_keys = [k for k in keys if not k.endswith(meta_suffixes)]
-    # the .23 float-source checkpoint had 793 (no metadata); ours has 800
-    # (791 weights + 8 norm biases + the router bias)
-    assert len(target_keys) == 800, (
-        f"expected 800 extractable tensors, got {len(target_keys)}"
+    # the vendor bias-fix norm biases are all-zero and GlmMTPRMSNorm has no
+    # bias — dropped (the .23 checkpoint has none). e_score_correction_bias
+    # is a REAL router tensor (fp32, ±15.8) — kept.
+    target_keys = [
+        k
+        for k in keys
+        if not k.endswith(meta_suffixes)
+        and (not k.endswith(".bias") or k.endswith("e_score_correction_bias"))
+    ]
+    assert len(target_keys) == 792, (
+        f"expected 792 extractable tensors (791 weights + the router bias, "
+        f"the 8 all-zero norm biases dropped), got {len(target_keys)}"
     )
     keys = target_keys
 
@@ -98,10 +105,12 @@ def main():
             t = sf.get_tensor(k)
         suffix = k.rsplit(".", 1)[-1]
         base = k[len(prefix):]
-        if suffix in ("weight_scale", "weight_offset", "scale_bias") or base in (
-            "mlp.gate.e_score_correction_bias",
-        ):
-            continue  # consumed by the weight dequant or dropped
+        if suffix in ("weight_scale", "weight_offset", "scale_bias"):
+            continue  # consumed by the weight dequant
+        if base.endswith(".bias") and base != "mlp.gate.e_score_correction_bias":
+            # the vendor bias-fix norm biases are all-zero and GlmMTPRMSNorm
+            # has no bias: drop (the .23 checkpoint has none either)
+            continue
         if t.dtype.is_floating_point:
             tensors[k] = t.contiguous()
             stats["float"] += 1
