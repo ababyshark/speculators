@@ -7,6 +7,7 @@ counters and reports per-position acceptance + mean accepted length.
 import argparse
 import asyncio
 import json
+from pathlib import Path
 import re
 import urllib.request
 
@@ -101,7 +102,7 @@ async def main():
         if args.save_json:
             import os
 
-            os.makedirs(os.path.dirname(args.save_json), exist_ok=True)
+            Path(args.save_json).parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "label": args.label,
                 "num_prompts": len(prompts),
