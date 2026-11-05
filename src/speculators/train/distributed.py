@@ -194,6 +194,29 @@ def maybe_destroy_distributed() -> None:
     _dp_group = None
 
 
+def _fsdp_wrap_candidates(layer: torch.nn.Module) -> list[torch.nn.Module]:
+    """Large submodules to wrap as separate FSDP units before the layer itself.
+
+    A single MTP/MoE decoder layer can hold ~10B params that would otherwise
+    all-gather as one ~20 GiB buffer per rank; wrapping the experts submodule
+    keeps the all-gather buffers bounded. Candidate paths cover both plain
+    decoder layers (mlp.experts) and wrappers nesting the MoE (mlp.moe).
+    Skips submodules already sharded (DTensor params).
+    """
+    candidates: list[torch.nn.Module] = []
+    for sub_name in ("mlp.moe", "mlp.experts"):
+        try:
+            sub = layer.get_submodule(sub_name)
+        except AttributeError:
+            continue
+        if any(
+            not isinstance(p, torch.distributed.tensor.DTensor)
+            for p in sub.parameters()
+        ):
+            candidates.append(sub)
+    return candidates
+
+
 def apply_fully_sharded(
     model: torch.nn.Module, param_dtype: torch.dtype = torch.bfloat16
 ):
@@ -205,12 +228,18 @@ def apply_fully_sharded(
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
-        reduce_dtype=torch.float32,
+        reduce_dtype=param_dtype,  # bf16 reduce: halves the transient grad
+        # buffers (fp32 reduce OOMs on 10B-param MoE experts); masters and
+        # optimizer moments stay fp32, which is where precision matters.
     )
 
     for layer in model.layers:  # type: ignore[union-attr]
+        for sub in _fsdp_wrap_candidates(layer):
+            fully_shard(sub, mp_policy=mp_policy)
         fully_shard(layer, mp_policy=mp_policy)
 
-    fully_shard(model, mp_policy=mp_policy)
+    # Root reshard: free the embed/lm_head unsharded buffer (~4 GiB bf16)
+    # after each forward — material on 61 GiB cards training a 10B MoE layer.
+    fully_shard(model, mp_policy=mp_policy, reshard_after_forward=True)
 
     return model

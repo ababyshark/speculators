@@ -536,6 +536,7 @@ def build_draft_model(
             t2d=t2d,
             d2t=d2t,
             verifier=args.verifier_name_or_path,
+            dtype=torch.float32,  # fp32 master weights; FSDP2 casts to bf16 on unshard
         )
 
     if args.speculator_type == "mtp":
@@ -590,6 +591,25 @@ def build_draft_model(
         d2t=d2t,
         **vars(args),
     )
+
+
+def freeze_grouped_expert_weights(model: torch.nn.Module) -> int:
+    """Freeze grouped expert weights (gate_up_proj + down_proj) in place.
+
+    HF's from_pretrained resets requires_grad=True on every parameter; this
+    runs after that reset. Their combined bf16 grads (~19.3 GiB for 256
+    experts) cannot coexist with the 19.3 GiB unsharded params on 61 GiB
+    cards during the MoE backward. The frozen weights keep the vendor
+    warm-start values; the adapter paths (attention, norms, eh_proj, shared
+    experts, router) still train. Returns the number of modules frozen.
+    """
+    frozen = 0
+    for m in model.modules():
+        if hasattr(m, "gate_up_proj") and hasattr(m, "down_proj"):
+            m.gate_up_proj.requires_grad_(False)
+            m.down_proj.requires_grad_(False)
+            frozen += 1
+    return frozen
 
 
 def main(cfg: TrainConfig):  # noqa: C901
@@ -667,6 +687,9 @@ def main(cfg: TrainConfig):  # noqa: C901
     model_class = registry[args.speculator_type]
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
+
+    if args.speculator_type == "mtp":
+        freeze_grouped_expert_weights(draft_model)
 
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]

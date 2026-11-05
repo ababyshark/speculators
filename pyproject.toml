@@ -260,9 +260,40 @@ select = [
     "S106", # allow hardcoded passwords in tests
     "S108", # allow probable insecure usage of temporary files in tests
     "PLW2901", # allow variable overwrite in tests
+    "PT018", # allow composite assertions in tests
+    "E501", # allow long fixture paths in tests
+    "PLC0415", # allow deferred heavy imports inside test functions
+    "PLR0124", # allow v == v as the NaN check for json floats
+    "RET504", # allow assign-then-return for readability
+    "SIM118", # allow .keys() iteration for dict-like fixtures
 ]
 "src/speculators/convert/**/*.py" = [
     "BLE001", # allow catching Exception for conversion errors
+]
+"examples/glm53_mtp/**/*.py" = [
+    "PTH123", # operational scripts use builtin open() for NFS path portability
+    "PTH208", # dir listing via os.listdir is fine for one-shot scripts
+    "SIM115", # checkpoint handles are kept open deliberately across shards
+    "SIM118", # .keys() iteration mirrors safetensors API style
+    "C901", # extraction/writeback main() is inherently multi-stage
+    "T201", # operator-facing print() is the logging channel in these scripts
+    "E402", # argparse setup precedes heavy imports by design
+    "S110", # best-effort cleanup paths
+    "BLE001", # best-effort cleanup paths
+    "RET504", # explicit assign-then-return reads clearer in pipelines
+    "F841", # probe variables kept for operator inspection
+    "PLC0415", # heavy imports deferred into main() for fast --help
+    "E501", # long literal paths/URLs in operator scripts
+    "ASYNC230", # one-shot operator scripts: blocking IO inside async is intentional
+    "ASYNC240", # one-shot operator scripts: pathlib inside async is intentional
+    "PLW0127", # intentional in-place variable refresh
+    "B007", # loop variables kept for readability in one-shot scripts
+    "E741", # single-letter math variables (I/l) in microbenchmarks
+    "ASYNC210", # one-shot operator scripts: blocking http inside async is intentional
+    "PIE810", # startswith chains read fine in operator scripts
+    "PLR1714", # repeated comparisons read fine in operator scripts
+    "S101", # asserts as operator sanity gates
+    "PTH211", # os.symlink in one-shot scripts
 ]
 "src/speculators/data_generation/**/*.py" = [
     "S106", # false positives for chat template tokens

@@ -92,7 +92,7 @@ def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
     )
 
 
-def load_model_layers(
+def load_model_layers(  # noqa: C901 -- vendor layout fallback is inherently branchy
     layer_names: list[str], model_path: str
 ) -> dict[str, torch.Tensor]:
     """
@@ -112,14 +112,32 @@ def load_model_layers(
             index = json.load(f)
         weight_map: dict[str, str] = index["weight_map"]
     except (FileNotFoundError, EntryNotFoundError):
-        logger.warning(
-            "`model.safetensors.index.json` file not found. "
-            "Checking for `model.safetensors` instead."
-        )
-        model_file = _resolve_file(model_path, "model.safetensors")
-        # Build virtual weight map for single-file models
-        with safe_open(model_file, framework="pt", device="cpu") as f:
-            weight_map = dict.fromkeys(f.keys(), "model.safetensors")
+        # Fall back to any sharded index (vendor layouts ship non-standard
+        # index names, e.g. quant_model_weights.safetensors.index.json)
+        # before assuming a single-file checkpoint.
+        alt_index: Path | None = None
+        model_path_obj = Path(model_path)
+        if model_path_obj.is_dir():
+            candidates = sorted(model_path_obj.glob("*.safetensors.index.json"))
+            if candidates:
+                alt_index = candidates[0]
+        if alt_index is not None:
+            logger.warning(
+                "`model.safetensors.index.json` not found; "
+                f"using sharded index {alt_index.name}."
+            )
+            with alt_index.open() as f:
+                index = json.load(f)
+            weight_map: dict[str, str] = index["weight_map"]
+        else:
+            logger.warning(
+                "`model.safetensors.index.json` file not found. "
+                "Checking for `model.safetensors` instead."
+            )
+            model_file = _resolve_file(model_path, "model.safetensors")
+            # Build virtual weight map for single-file models
+            with safe_open(model_file, framework="pt", device="cpu") as f:
+                weight_map = dict.fromkeys(f.keys(), "model.safetensors")
 
     # Resolve names: try exact match, then suffix match, then known aliases
     name_to_key = {}  # Maps input name to actual checkpoint key

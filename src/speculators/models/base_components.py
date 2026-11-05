@@ -99,6 +99,22 @@ try:
 except ImportError:
     pass
 
+try:
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+        GlmMoeDsaDecoderLayer,
+        GlmMoeDsaRMSNorm,
+        GlmMoeDsaRotaryEmbedding,
+    )
+
+    model_classes["glm_moe_dsa"] = ModelComponents(
+        GlmMoeDsaDecoderLayer,
+        GlmMoeDsaDecoderLayer,
+        GlmMoeDsaRMSNorm,
+        GlmMoeDsaRotaryEmbedding,
+    )
+except ImportError:
+    pass
+
 
 def override_components(model_type: str, **overrides) -> ModelComponents:
     """Override specific components from a base model architecture.

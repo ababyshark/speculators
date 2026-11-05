@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import time
@@ -80,7 +81,12 @@ class _StepTimer:
             torch.accelerator.synchronize()
             self._marks[name] = time.perf_counter()
             if torch.accelerator.is_available():
-                self._memory[name] = torch.accelerator.memory_allocated() / (1024**2)
+                with contextlib.suppress(RuntimeError, AssertionError):
+                    # torch.accelerator memory stats are not wired up on every
+                    # backend; keep the timer alive without them.
+                    self._memory[name] = torch.accelerator.memory_allocated() / (
+                        1024**2
+                    )
 
     def mark_value(self, name: str, value: float) -> None:
         if self.enabled:
@@ -362,7 +368,21 @@ class Trainer:
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
+        def _mem(tag: str) -> None:
+            try:
+                import torch_npu  # noqa: PLC0415
+
+                alloc = torch_npu.npu.memory_allocated() / 2**30
+                resv = torch_npu.npu.memory_reserved() / 2**30
+                root_logger.info(
+                    f"[mem] {tag}: alloc={alloc:.2f}GiB reserved={resv:.2f}GiB"
+                )
+            except (RuntimeError, AssertionError, ImportError):
+                root_logger.info(f"[mem] {tag}: n/a")
+
+        _mem("before fully_shard")
         apply_fully_sharded(self.model, param_dtype=self.config.hidden_states_dtype)
+        _mem("after fully_shard")
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
@@ -379,6 +399,17 @@ class Trainer:
             )
             del full_state_dict
             dist.barrier()
+        _mem("after state dict load/broadcast")
+        # Release broadcast/all-gather transients so the first forward's
+        # large FSDP all-gathers can get contiguous blocks (NPU allocator
+        # otherwise keeps them fragmented across cached segments).
+        try:
+            import torch_npu  # noqa: PLC0415
+
+            torch_npu.npu.empty_cache()
+        except (RuntimeError, AssertionError, ImportError):
+            pass
+        _mem("after empty_cache")
 
     def _setup_model_ddp(self, load_checkpoint: bool):
         self.model.to(self.local_rank)  # type: ignore[arg-type]
@@ -546,6 +577,17 @@ class Trainer:
                 )
 
             timer.mark("fwd")
+            # Free cached forward transients before backward: the MoE experts
+            # backward materializes ~19 GiB of weight grads and needs contiguous
+            # blocks (fragmentation otherwise OOMs on 61 GiB cards).
+            try:
+                import torch_npu  # noqa: PLC0415
+
+                torch_npu.npu.empty_cache()
+            except (RuntimeError, ImportError):
+                torch.accelerator.empty_cache() if hasattr(
+                    torch.accelerator, "empty_cache"
+                ) else None
             self._optimizers_zero_grad()
             loss.backward()
             timer.mark("pre_clip")

@@ -24,6 +24,41 @@ logger = logging.getLogger(__name__)
 __all__ = ["MTPDraftModel", "compute_step_weights"]
 
 _IGNORE_INDEX = -100
+
+
+class _VocabCE(torch.autograd.Function):
+    """Vocab-CE as a custom Function: forward = logsumexp - target_logit,
+    backward = (softmax - onehot) * mask via plain elementwise kernels.
+
+    F.cross_entropy / logsumexp-autograd hit pathologically slow kernel paths
+    on NPU for very large vocab (154880: ~82% of step time); this decomposition
+    uses only fast native reductions/elementwise ops and is mathematically
+    identical (fp32 internally)."""
+
+    @staticmethod
+    def forward(ctx, logits, targets, ignore_index):  # logits [N, V] bf16
+        lf = logits.float()
+        lse = torch.logsumexp(lf, dim=-1)
+        tgt_logit = lf.gather(1, targets.clamp_min(0).unsqueeze(1)).squeeze(1)
+        nll = lse - tgt_logit
+        nll = torch.where(targets == ignore_index, torch.zeros_like(nll), nll)
+        ctx.save_for_backward(logits, targets)
+        ctx.ignore_index = ignore_index
+        return nll
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        logits, targets = ctx.saved_tensors
+        lf = logits.float()
+        softmax = torch.exp(lf - torch.logsumexp(lf, dim=-1, keepdim=True))
+        onehot = torch.zeros_like(softmax).scatter_(
+            1, targets.clamp_min(0).unsqueeze(1), 1.0
+        )
+        mask = (targets != ctx.ignore_index).unsqueeze(1).to(softmax.dtype)
+        g = (softmax - onehot) * mask * grad_out.to(softmax.dtype).unsqueeze(1)
+        return g.to(logits.dtype), None, None
+
+
 _QWEN3_5_MODEL_TYPES = {"qwen3_5_text", "qwen3_5_moe_text"}
 _QWEN3_5_MROPE_POSITION_ID_RANK = 3
 _QWEN3_5_MROPE_SECTIONS = 3
@@ -251,23 +286,34 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
                 position_embeddings=step_pos_emb,
             )
 
-            logits = self.lm_head(mtp_output)
-            all_logits.append(logits)
-
             step_targets = input_ids[:, step + 2 : step + 2 + valid_len]
             if loss_mask is not None:
                 step_mask = loss_mask[:, step + 2 : step + 2 + valid_len]
                 step_targets = step_targets.clone()
                 step_targets[step_mask == 0] = _IGNORE_INDEX
             weight = step_weights[step] if step_weights is not None else 1.0
-            unreduced = nn.functional.cross_entropy(
-                logits.permute(0, 2, 1),
-                step_targets,
-                ignore_index=_IGNORE_INDEX,
-                reduction="none",
+
+            # lm_head+CE inside activation checkpointing: the full-vocab
+            # logits and CE intermediates (~1.9 GiB/step at 154880 vocab) are
+            # freed after the forward pass and recomputed during backward.
+            # Gradients through mtp_output and lm_head are unchanged.
+            #
+            # CE is computed as logsumexp(logits) - logits[target] instead of
+            # F.cross_entropy: the latter hits a pathologically slow kernel
+            # path on NPU for very large vocab (~82% of step time), while
+            # logsumexp is a native fast reduction. fp32 upcast improves
+            # numeric precision.
+            def _step_ce(mo=mtp_output, tg=step_targets):
+                logits = self.lm_head(mo)  # [B, T, V] (bf16)
+                logits = logits.permute(0, 2, 1).reshape(-1, logits.shape[-1])
+                tgt = tg.reshape(-1)
+                nll = _VocabCE.apply(logits, tgt, _IGNORE_INDEX)
+                valid_count = (tgt != _IGNORE_INDEX).sum()
+                return nll.sum() / valid_count.clamp(min=1)
+
+            step_loss = weight * torch.utils.checkpoint.checkpoint(
+                _step_ce, use_reentrant=False
             )
-            valid_count = (step_targets != _IGNORE_INDEX).sum()
-            step_loss = weight * unreduced.sum() / valid_count.clamp(min=1)
             total_loss = total_loss + step_loss
             metrics[f"loss_step_{step}"] = step_loss.detach().clone()
 

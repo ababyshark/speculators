@@ -1,4 +1,5 @@
 import functools
+import gc
 import json
 import logging
 import shutil
@@ -21,6 +22,69 @@ from transformers.modeling_utils import PreTrainedModel
 
 from speculators.train.distributed import get_rank, is_distributed
 from speculators.utils.util import get_current_device
+
+
+def _fill_missing_named_optimizer_states(model, full_state_dict) -> int:
+    """Insert zero AdamW moments (FQN-keyed, full tensors) for params missing
+    from a DCP optimizer checkpoint — params whose grads never flowed (e.g.
+    DSA indexer top-k, non-differentiable) so resume can proceed."""
+    states = full_state_dict.setdefault("state", {})
+    sample = next(
+        (s for s in states.values() if isinstance(s, dict) and "exp_avg" in s), None
+    )
+    if sample is None:
+        return 0  # not AdamW-style state; let the error propagate
+    step = sample.get("step")
+    filled = 0
+    for name, p in model.named_parameters():
+        if name in states or not p.requires_grad:
+            continue
+        states[name] = {
+            "step": step.clone()
+            if torch.is_tensor(step)
+            else torch.tensor(step or 0.0),
+            "exp_avg": torch.zeros(p.shape, dtype=sample["exp_avg"].dtype),
+            "exp_avg_sq": torch.zeros(p.shape, dtype=sample["exp_avg_sq"].dtype),
+        }
+        filled += 1
+    return filled
+
+
+def _fill_missing_optimizer_states(opt, state_dict) -> int:
+    """Insert zero AdamW moments for params missing from a checkpoint.
+
+    torch assigns state labels by enumerating param_groups' params in order;
+    params whose grads never flowed (e.g. DSA indexer, non-differentiable
+    top-k) have no saved state and make strict resume fail.
+    """
+    states = state_dict.setdefault("state", {})
+    steps = [s["step"] for s in states.values() if isinstance(s, dict) and "step" in s]
+    if not any("exp_avg" in s for s in states.values() if isinstance(s, dict)):
+        return 0  # not AdamW-style state; let the error propagate
+    max_step = None
+    for s in steps:
+        if torch.is_tensor(s):
+            max_step = s if max_step is None or float(s) > float(max_step) else max_step
+        else:
+            max_step = s if max_step is None or s > max_step else max_step
+    label = 0
+    filled = 0
+    for group in opt.param_groups:
+        for p in group["params"]:
+            if label not in states:
+                states[label] = {
+                    "step": max_step.clone()
+                    if torch.is_tensor(max_step)
+                    else torch.tensor(max_step or 0.0),
+                    "exp_avg": torch.zeros_like(p, memory_format=torch.preserve_format),
+                    "exp_avg_sq": torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    ),
+                }
+                filled += 1
+            label += 1
+    return filled
+
 
 logger = logging.getLogger("speculators")
 
@@ -262,6 +326,33 @@ class BaseCheckpointer:
                 raise RuntimeError(f"Failed to delete {child}") from exc
 
 
+# Suffixes of tensors that must KEEP their training-time dtype when the model
+# state dict is cast for checkpointing. e_score_correction_bias is the
+# DeepSeek aux-loss-free router balancing bias: a BUFFER (never trained), it
+# accumulates to ~15.8 magnitude while its informative spread is only ~0.08.
+# bf16 rounding (~0.016 mean at that magnitude = 11.5% of the spread) flips
+# the top-8 expert selection for 75% of tokens (measured on real hidden
+# states), which collapses serving acceptance. Keep it fp32 end to end.
+PRECISION_PRESERVE_SUFFIXES = ("e_score_correction_bias",)
+
+
+def cast_model_state_dict(sd: dict, dtype: torch.dtype | None) -> dict:
+    """Named-tensor cast for checkpointing that preserves precision-sensitive
+    tensors (see PRECISION_PRESERVE_SUFFIXES)."""
+    out = {}
+    for key, value in sd.items():
+        if (
+            dtype is not None
+            and isinstance(value, torch.Tensor)
+            and value.is_floating_point()
+            and not key.endswith(PRECISION_PRESERVE_SUFFIXES)
+        ):
+            out[key] = value.to(dtype)
+        else:
+            out[key] = value
+    return out
+
+
 def convert_float_dtype(sd: pytree.PyTree, dtype: torch.dtype) -> pytree.PyTree:
     def convert_fn(x):
         if isinstance(x, torch.Tensor) and x.is_floating_point():
@@ -333,7 +424,22 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         )
         dtype = float_dtype or raw_model.dtype
         for opt, state_dict in zip(optimizers, loaded_list, strict=True):
-            opt.load_state_dict(convert_float_dtype(state_dict, dtype))
+            try:
+                opt.load_state_dict(convert_float_dtype(state_dict, dtype))
+            except (RuntimeError, ValueError) as e:
+                # Params whose gradients never flowed (e.g. DSA indexer top-k
+                # selection is non-differentiable) have no optimizer state in
+                # the checkpoint. Fill zero moments for them (identical to
+                # their epoch-1 behavior) so resume can proceed.
+                if "no saved optimizer state" not in str(e):
+                    raise
+                filled = _fill_missing_optimizer_states(opt, state_dict)
+                logging.getLogger(__name__).warning(
+                    "Optimizer checkpoint missing state for %d zero-grad "
+                    "params (e.g. DSA indexer); filled with zero moments.",
+                    filled,
+                )
+                opt.load_state_dict(convert_float_dtype(state_dict, dtype))
 
     @_rank0_only
     def save_checkpoint(
@@ -398,6 +504,15 @@ class DistributedCheckpointer(BaseCheckpointer):
             full_state_dict, float_dtype or model.dtype
         )
 
+        filled = _fill_missing_named_optimizer_states(model, full_state_dict)
+        if filled:
+            logging.getLogger(__name__).warning(
+                "Optimizer checkpoint missing state for %d zero-grad params "
+                "(e.g. DSA indexer top-k, non-differentiable); filled with "
+                "zero moments.",
+                filled,
+            )
+
         set_optimizer_state_dict(
             model,
             optimizers,
@@ -420,17 +535,49 @@ class DistributedCheckpointer(BaseCheckpointer):
         epoch: int | str,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
+        # Free allocator caches before the DCP full-gather: the gather
+        # re-shards each DTensor to FULL on device before cpu_offload, and the
+        # training working set sits at the ~65 GB card limit — the largest
+        # tensor (grouped gate_up, ~26 GB bf16) plus leftover activation cache
+        # blocks can tip the allocation (observed: 5.9 MB short, HcclAllGather
+        # OOM at the epoch-1 save).
+        gc.collect()
+        for _m in ("npu", "cuda"):
+            _mod = getattr(torch, _m, None)
+            if _mod is None or not hasattr(_mod, "empty_cache"):
+                continue
+            try:
+                if _m == "cuda" and not _mod.is_available():
+                    continue
+                _mod.empty_cache()
+            except Exception:  # noqa: BLE001 -- best-effort cache release
+                logger.debug("empty_cache(%s) failed during save", _m, exc_info=True)
+
         model_state_dict = get_model_state_dict(
             model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
         )
-        model_state_dict = convert_float_dtype(model_state_dict, float_dtype)
+        model_state_dict = cast_model_state_dict(model_state_dict, float_dtype)
+
+        gc.collect()
+        for _m in ("npu", "cuda"):
+            _mod = getattr(torch, _m, None)
+            if _mod is None or not hasattr(_mod, "empty_cache"):
+                continue
+            try:
+                if _m == "cuda" and not _mod.is_available():
+                    continue
+                _mod.empty_cache()
+            except Exception:  # noqa: BLE001 -- best-effort cache release
+                logger.debug("empty_cache(%s) failed during save", _m, exc_info=True)
 
         optimizer_state_dict = get_optimizer_state_dict(
             model,
             _as_list(optimizer),
             options=StateDictOptions(full_state_dict=True, cpu_offload=True),
         )
-        optimizer_state_dict = convert_float_dtype(optimizer_state_dict, float_dtype)
+        # Keep optimizer moments in their native fp32: casting moments to bf16
+        # loses update precision and compounds across resumes.
+        optimizer_state_dict = convert_float_dtype(optimizer_state_dict, None)
 
         if get_rank() == 0:
             # Only rank 0 saves the checkpoint
