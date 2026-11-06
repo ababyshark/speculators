@@ -685,7 +685,8 @@ class Trainer:
 
             timer.mark("fwd")
             self._optimizers_zero_grad()
-            loss.backward()
+            if loss.requires_grad:
+                loss.backward()
             timer.mark("pre_clip")
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), 1.0, error_if_nonfinite=True

@@ -112,6 +112,35 @@ def main():
                     raise RuntimeError(f"Round-trip mismatch: {key}")
                 output_index[key] = filename
         print(f"verified {filename}: {len(tensors)} tensors", flush=True)
+    norm_shape = expected["verifier_norm.weight"]
+    if tuple(_norm_w.shape) != norm_shape:
+        raise ValueError(
+            "verifier_norm.weight shape mismatch: "
+            f"{tuple(_norm_w.shape)} != {norm_shape}"
+        )
+    norm_digest = hashlib.sha256(
+        _norm_w.view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
+    save_file(
+        {"verifier_norm.weight": _norm_w.contiguous()},
+        str(dst / "verifier_norm.safetensors"),
+    )
+    with safe_open(str(dst / "verifier_norm.safetensors"), framework="pt") as f:
+        actual = hashlib.sha256(
+            f.get_tensor("verifier_norm.weight")
+            .view(torch.uint8)
+            .numpy()
+            .tobytes()
+        ).hexdigest()
+    if actual != norm_digest:
+        raise RuntimeError("Round-trip mismatch: verifier_norm.weight")
+    output_index["verifier_norm.weight"] = "verifier_norm.safetensors"
+    records["verifier_norm.weight"] = dict(
+        source_key="model.norm.weight",
+        shape=list(_norm_w.shape),
+        dtype=str(_norm_w.dtype),
+        sha256=norm_digest,
+    )
     (dst / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": output_index}, indent=2)
     )

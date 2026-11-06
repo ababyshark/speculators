@@ -1,6 +1,7 @@
 """GLM native MTP components; single-step training is the initial contract."""
 
 import copy
+from importlib.metadata import version as _package_version
 
 import torch
 from torch import nn
@@ -14,6 +15,16 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaTopkRouter,
     apply_rotary_pos_emb_interleave,
 )
+
+_transformers_version = tuple(
+    int(part) for part in _package_version("transformers").split(".")[:2]
+)
+if not (5, 15) <= _transformers_version < (5, 19):
+    raise ImportError(
+        "GLM MTP requires transformers>=5.15,<5.19: the glm_moe_dsa "
+        "router/rotary APIs it builds on are not stable across 5.x; "
+        f"found {_package_version('transformers')}"
+    )
 
 
 class GlmMTPRMSNorm(GlmMoeDsaRMSNorm):

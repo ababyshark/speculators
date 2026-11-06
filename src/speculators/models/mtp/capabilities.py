@@ -111,38 +111,6 @@ def json_names(checkpoint: Path) -> set[str]:
     return set()
 
 
-def apply_glm_asset_facts(config: Any, verifier_path: str | Path) -> None:
-    """Populate ``mtp_own_head`` / ``mtp_own_embed`` / ``mtp_has_rot``.
-
-    Reads the native GLM package at ``verifier_path`` (index headers only for
-    key presence, quant metadata for the rot gate) so the training model's
-    capability reflects the actual asset.  No-op for non-GLM model types.
-    """
-    layer_config = config.transformer_layer_config
-    if getattr(layer_config, "model_type", None) != "glm_moe_dsa":
-        return
-    checkpoint = Path(verifier_path)
-    keys = json_names(checkpoint)
-    if not keys:
-        return
-    from speculators.convert.mtp.glm_layout import (  # type: ignore[import-not-found]  # noqa: PLC0415
-        detect_glm_native_prefix,
-        read_quant_is_rot_used,
-    )
-
-    prefix = detect_glm_native_prefix(keys)
-    config.mtp_own_head = f"{prefix}shared_head.head.weight" in keys
-    config.mtp_own_embed = f"{prefix}embed_tokens.weight" in keys
-    config.mtp_has_rot = "rot.weight" in keys or f"{prefix}rot.weight" in keys
-    if config.mtp_has_rot:
-        quant_is_rot_used = read_quant_is_rot_used(checkpoint)
-        if quant_is_rot_used is False:
-            raise ValueError(
-                "rot_gate_consistent=false: quant metadata is_rot_used=False "
-                "but the package carries a rot.weight tensor."
-            )
-
-
 @dataclass(frozen=True)
 class MTPCapability:
     """Non-architectural policy for one MTP model type.
