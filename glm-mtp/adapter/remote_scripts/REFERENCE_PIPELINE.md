@@ -18,19 +18,19 @@
 
 ## 2. 路径与设备
 
-| 项目 | 路径/配置 |
-|---|---|
-| verifier | `/data1/weight/GLM-5.3-w4a8-spec` |
-| 原始 JSONL | `/data1/spec_train_data/train_10k.jsonl` |
+| 项目             | 路径/配置                                             |
+| ---------------- | ----------------------------------------------------- |
+| verifier         | `/data1/weight/GLM-5.3-w4a8-spec`                     |
+| 原始 JSONL       | `/data1/spec_train_data/train_10k.jsonl`              |
 | 8K prepared 数据 | `/data1/spec_train_data/prepared_8k_dflash2_official` |
-| Speculators | `/workspace/speculators` |
-| 训练脚本目录 | `/workspace/adapter` |
-| 容器 | `vllm_030_mtp_train` |
-| 教师 NPU | 0–7，TP=8 |
-| 训练 NPU | 8–15，FSDP 分片 |
-| 教师端口 | 8000 |
-| 推理回归端口 | 8010 |
-| HCCL 超时 | `HCCL_CONNECT_TIMEOUT=3600` |
+| Speculators      | `/workspace/speculators`                              |
+| 训练脚本目录     | `/workspace/adapter`                                  |
+| 容器             | `vllm_030_mtp_train`                                  |
+| 教师 NPU         | 0–7，TP=8                                             |
+| 训练 NPU         | 8–15，FSDP 分片                                       |
+| 教师端口         | 8000                                                  |
+| 推理回归端口     | 8010                                                  |
+| HCCL 超时        | `HCCL_CONNECT_TIMEOUT=3600`                           |
 
 ## 3. 教师服务和 hidden states
 
@@ -171,13 +171,12 @@ vllm serve /data1/mtp_training/runs/glm53_mtp_online_v2/stitched \
 
 ## 10. 阶段门禁
 
-| 阶段 | 必须通过的条件 |
-|---|---|
-| 教师服务 | health 200，layer 78 hidden states 可生成、可消费，启动参数和日志完整 |
-| 原生初始化 | 不使用 DRAFT；native MTP key/shape/dtype/hash 检查通过 |
-| 单步 parity | 原生 MTP 与训练 forward 的 hidden/logits 误差在阈值内 |
-| 五步实现 | 每步 loss/梯度有限，step 1–5 label shift 和 mask 正确 |
-| 容量 | 5-step 8K 单步和连续短跑无 OOM |
-| checkpoint | stitch 后可加载，权重变化范围符合预期，恢复状态可审计 |
-| 服务回归 | 5-token speculative service 正常，接受率和输出正确性可复现 |
-
+| 阶段        | 必须通过的条件                                                        |
+| ----------- | --------------------------------------------------------------------- |
+| 教师服务    | health 200，layer 78 hidden states 可生成、可消费，启动参数和日志完整 |
+| 原生初始化  | 不使用 DRAFT；native MTP key/shape/dtype/hash 检查通过                |
+| 单步 parity | 原生 MTP 与训练 forward 的 hidden/logits 误差在阈值内                 |
+| 五步实现    | 每步 loss/梯度有限，step 1–5 label shift 和 mask 正确                 |
+| 容量        | 5-step 8K 单步和连续短跑无 OOM                                        |
+| checkpoint  | stitch 后可加载，权重变化范围符合预期，恢复状态可审计                 |
+| 服务回归    | 5-token speculative service 正常，接受率和输出正确性可复现            |

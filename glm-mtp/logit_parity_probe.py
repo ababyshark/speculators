@@ -48,7 +48,9 @@ def main():
     cfg = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
     cfg._attn_implementation = "eager"
 
-    ws = load_dir("/mnt/share_space/l00840580/dspark-glm53/drafter_init/glm53-mtp-warmstart-signed")
+    ws = load_dir(
+        "/mnt/share_space/l00840580/dspark-glm53/drafter_init/glm53-mtp-warmstart-signed"
+    )
 
     from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
         GlmMoeDsaDecoderLayer,
@@ -73,17 +75,29 @@ def main():
     embed = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size).to(dev, torch.bfloat16)
     embed.weight.data = ws["embed_tokens.weight"].to(dev, torch.bfloat16)
     enorm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(dev, torch.bfloat16)
-    enorm.weight.data = ws["mtp_layers.0.token_layernorm.weight"].to(dev, torch.bfloat16)
+    enorm.weight.data = ws["mtp_layers.0.token_layernorm.weight"].to(
+        dev, torch.bfloat16
+    )
     hnorm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(dev, torch.bfloat16)
-    hnorm.weight.data = ws["mtp_layers.0.hidden_layernorm.weight"].to(dev, torch.bfloat16)
-    final_norm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(dev, torch.bfloat16)
-    final_norm.weight.data = ws["mtp_layers.0.final_layernorm.weight"].to(dev, torch.bfloat16)
+    hnorm.weight.data = ws["mtp_layers.0.hidden_layernorm.weight"].to(
+        dev, torch.bfloat16
+    )
+    final_norm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(
+        dev, torch.bfloat16
+    )
+    final_norm.weight.data = ws["mtp_layers.0.final_layernorm.weight"].to(
+        dev, torch.bfloat16
+    )
     eh_w = ws["mtp_layers.0.input_proj.weight"].to(dev, torch.bfloat16)
     head_w = ws["lm_head.weight"].to(dev, torch.bfloat16)
 
     layer = GlmMoeDsaDecoderLayer(cfg, layer_idx=0).to(torch.bfloat16).to(dev)
     layer.eval()
-    ws_layer = {k[len("mtp_layers.0."):]: v for k, v in ws.items() if k.startswith("mtp_layers.0.")}
+    ws_layer = {
+        k[len("mtp_layers.0.") :]: v
+        for k, v in ws.items()
+        if k.startswith("mtp_layers.0.")
+    }
     missing, unexpected = layer.load_state_dict(ws_layer, strict=False)
     print(f"layer load: missing={len(missing)} unexpected={len(unexpected)}")
 
@@ -97,7 +111,7 @@ def main():
         en = enorm(e)
         hn = hnorm(hs)
         # stage 2: eh_proj
-        proj = (torch.cat([en, hn], dim=-1) @ eh_w.t())
+        proj = torch.cat([en, hn], dim=-1) @ eh_w.t()
         # stage 3: the layer (attention + MoE)
         pos = torch.arange(T, device=dev).unsqueeze(0)
         pos_emb = rotary(proj.unsqueeze(0), pos)
@@ -120,7 +134,9 @@ def main():
     print("\n== reference (serving-composed) stage outputs ==")
     print(f"proj: shape={tuple(proj.shape)} absmean={proj.float().abs().mean():.5f}")
     print(f"layer_out: absmean={layer_out.float().abs().mean():.5f}")
-    print(f"logits: shape={tuple(logits.shape)} absmax={logits.float().abs().max():.2f}")
+    print(
+        f"logits: shape={tuple(logits.shape)} absmax={logits.float().abs().max():.2f}"
+    )
     argmax = logits.argmax(-1)
     actual = toks[2 : T + 2]
     agree = (argmax.cpu() == actual[:T].cpu()).float().mean().item()
@@ -132,11 +148,11 @@ def main():
 
     # the mixin composition manual reference:
     proj2 = layer.input_proj(
-        torch.cat(
-            [layer.token_layernorm(e), layer.hidden_layernorm(hs)], dim=-1
-        )
+        torch.cat([layer.token_layernorm(e), layer.hidden_layernorm(hs)], dim=-1)
     )
-    print(f"\nmixin-path proj vs serving-path proj: cos={cos(proj2, proj):.6f} maxdiff={(proj2 - proj).abs().max().item():.2e}")
+    print(
+        f"\nmixin-path proj vs serving-path proj: cos={cos(proj2, proj):.6f} maxdiff={(proj2 - proj).abs().max().item():.2e}"
+    )
 
     # the layer rerun via the mixin-equivalent path (the same weights, the
     # HF layer forward directly) — determinism check

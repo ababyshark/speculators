@@ -1,4 +1,5 @@
 """Canonical ordering for logically equivalent sparse attention selections."""
+
 import torch
 
 

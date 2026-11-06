@@ -4,6 +4,7 @@ The training checkpoint omits MTP embed_tokens/shared_head because they are stor
 in mtp_shared_weights_path. This exporter adds those two tensors and writes an
 index that maps the 791 trained tensors and the shared tensors to separate files.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,14 +20,17 @@ from safetensors.torch import save_file
 
 def digest(tensor) -> str:
     import torch
-    return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+
+    return hashlib.sha256(
+        tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    ).hexdigest()
 
 
 def reverse_key(key: str, layer: int) -> str:
     prefix = "mtp_layers.0."
     if not key.startswith(prefix):
         raise ValueError(f"Unexpected trained key: {key}")
-    body = key[len(prefix):]
+    body = key[len(prefix) :]
     replacements = (
         ("token_layernorm.", "enorm."),
         ("hidden_layernorm.", "hnorm."),
@@ -35,7 +39,7 @@ def reverse_key(key: str, layer: int) -> str:
     )
     for src, dst in replacements:
         if body.startswith(src):
-            body = dst + body[len(src):]
+            body = dst + body[len(src) :]
             break
     return f"model.layers.{layer}.{body}"
 
@@ -82,26 +86,33 @@ def requant_writeback(cp: Path, target: Path, out: Path, layer: int) -> dict:
         all_train_keys = sorted(f.keys())
         skipped_reference = [k for k in all_train_keys if k.startswith("verifier_")]
         if skipped_reference:
-            print(f"skipped {len(skipped_reference)} verifier reference key(s): {skipped_reference[:3]}")
+            print(
+                f"skipped {len(skipped_reference)} verifier reference key(s): {skipped_reference[:3]}"
+            )
         train_keys = [k for k in all_train_keys if not k.startswith("verifier_")]
         mapped = {reverse_key(k, layer): k for k in train_keys}
     if len(mapped) != len(train_keys):
         raise RuntimeError("Reverse mapping is not bijective")
     native_keys = {k for k in weight_map if k.startswith(prefix)}
-    unmapped = native_keys - set(mapped) - {
-        k for k in native_keys if k.endswith(meta_suffixes)
-    }
+    unmapped = (
+        native_keys
+        - set(mapped)
+        - {k for k in native_keys if k.endswith(meta_suffixes)}
+    )
     if unmapped:
-        raise RuntimeError(
-            {"layer tensors without a trained source": sorted(unmapped)}
-        )
+        raise RuntimeError({"layer tensors without a trained source": sorted(unmapped)})
 
     out.mkdir(parents=True)
     for name in ("config.json", "quant_model_description.json"):
         src = target / name
         if src.exists():
             shutil.copy2(src, out / name)
-    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json"):
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ):
         src = target / name
         if src.exists():
             shutil.copy2(src, out / name)
@@ -120,7 +131,9 @@ def requant_writeback(cp: Path, target: Path, out: Path, layer: int) -> dict:
             base = nk.rsplit(".", 1)[0]
             scale_key = f"{base}.weight_scale"
             quantized = scale_key in weight_map
-            with safe_open(str(target / weight_map[nk]), framework="pt", device="cpu") as sf:
+            with safe_open(
+                str(target / weight_map[nk]), framework="pt", device="cpu"
+            ) as sf:
                 stored_shape = tuple(sf.get_tensor(nk).shape)
                 stored_dtype = sf.get_tensor(nk).dtype
             if quantized:
@@ -149,7 +162,9 @@ def requant_writeback(cp: Path, target: Path, out: Path, layer: int) -> dict:
                             str(target / weight_map[meta]), framework="pt", device="cpu"
                         ) as sf:
                             ref = sf.get_tensor(meta)
-                        rewrite.setdefault(weight_map[meta], {})[meta] = torch.zeros_like(ref)
+                        rewrite.setdefault(weight_map[meta], {})[meta] = (
+                            torch.zeros_like(ref)
+                        )
                         records[meta] = {"mode": "zeroed", "trained_key": tk}
             else:
                 if stored_shape != tuple(w.shape):
@@ -197,7 +212,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--native-source", default="/data1/mtp_training/weights/glm53_mtp_native_step0")
+    ap.add_argument(
+        "--native-source", default="/data1/mtp_training/weights/glm53_mtp_native_step0"
+    )
     ap.add_argument("--target-model", default="/data1/weight/GLM-5.3-w4a8-spec")
     ap.add_argument(
         "--requant-w4a8",
@@ -224,10 +241,20 @@ def main() -> None:
 
     if args.requant_w4a8:
         report = requant_writeback(cp, target, out, layer)
-        print(json.dumps({k: report[k] for k in ("stats", "rewritten_tensors", "trained_tensor_count")}, indent=2))
+        print(
+            json.dumps(
+                {
+                    k: report[k]
+                    for k in ("stats", "rewritten_tensors", "trained_tensor_count")
+                },
+                indent=2,
+            )
+        )
         return
 
-    native_index = json.loads((native / "model.safetensors.index.json").read_text())["weight_map"]
+    native_index = json.loads((native / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
 
     with safe_open(str(train_file), framework="pt", device="cpu") as f:
         all_train_keys = sorted(f.keys())
@@ -235,7 +262,9 @@ def main() -> None:
         # are not part of the native MTP layer (same contract as stitch).
         skipped_reference = [k for k in all_train_keys if k.startswith("verifier_")]
         if skipped_reference:
-            print(f"skipped {len(skipped_reference)} verifier reference key(s): {skipped_reference[:3]}")
+            print(
+                f"skipped {len(skipped_reference)} verifier reference key(s): {skipped_reference[:3]}"
+            )
         train_keys = [k for k in all_train_keys if not k.startswith("verifier_")]
         mapped = {reverse_key(k, layer): k for k in train_keys}
     if len(mapped) != len(train_keys):
@@ -251,10 +280,14 @@ def main() -> None:
     with safe_open(str(train_file), framework="pt", device="cpu") as tf:
         for nk, tk in mapped.items():
             train_shape = tuple(tf.get_tensor(tk).shape)
-            with safe_open(str(native / native_index[nk]), framework="pt", device="cpu") as nf:
+            with safe_open(
+                str(native / native_index[nk]), framework="pt", device="cpu"
+            ) as nf:
                 native_shape = tuple(nf.get_tensor(nk).shape)
             if native_shape != train_shape:
-                raise RuntimeError(f"Shape mismatch for {nk}: {train_shape} vs {native_shape}")
+                raise RuntimeError(
+                    f"Shape mismatch for {nk}: {train_shape} vs {native_shape}"
+                )
 
     out.mkdir(parents=True)
     os.symlink(str(train_file.resolve()), out / "model.safetensors")
@@ -279,7 +312,12 @@ def main() -> None:
         json.dumps({"metadata": {}, "weight_map": weight_map}, indent=2) + "\n"
     )
     shutil.copy2(target / "config.json", out / "config.json")
-    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json"):
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ):
         src = target / name
         if src.exists():
             shutil.copy2(src, out / name)
@@ -287,24 +325,39 @@ def main() -> None:
     with safe_open(str(train_file), framework="pt", device="cpu") as f:
         for nk, tk in sorted(mapped.items()):
             t = f.get_tensor(tk)
-            records.append({"name": nk, "source_key": tk, "shape": list(t.shape), "dtype": str(t.dtype), "sha256": digest(t)})
-    (out / "export_report.json").write_text(json.dumps({
-        "passed": True,
-        "checkpoint": str(cp),
-        "native_source": str(native),
-        "target_model": str(target),
-        "layer": layer,
-        "trained_tensor_count": len(mapped),
-        "shared_tensor_count": len(shared),
-        "weight_map_count": len(weight_map),
-        "weight_storage": "model.safetensors symlink to checkpoint; mtp_shared.safetensors contains omitted embedding/head",
-        "shared_records": shared_records,
-        "trained_records": records,
-    }, indent=2) + "\n")
-    print(f"EXPORT_PASSED trained={len(mapped)} shared={len(shared)} output={out}", flush=True)
+            records.append(
+                {
+                    "name": nk,
+                    "source_key": tk,
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "sha256": digest(t),
+                }
+            )
+    (out / "export_report.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "checkpoint": str(cp),
+                "native_source": str(native),
+                "target_model": str(target),
+                "layer": layer,
+                "trained_tensor_count": len(mapped),
+                "shared_tensor_count": len(shared),
+                "weight_map_count": len(weight_map),
+                "weight_storage": "model.safetensors symlink to checkpoint; mtp_shared.safetensors contains omitted embedding/head",
+                "shared_records": shared_records,
+                "trained_records": records,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(
+        f"EXPORT_PASSED trained={len(mapped)} shared={len(shared)} output={out}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
     main()
-
-

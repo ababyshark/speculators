@@ -14,13 +14,10 @@ from torch import nn
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
     GlmMoeDsaConfig,
 )
-from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-    GlmMoeDsaForCausalLM,
-)
 
+from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.models.mtp import MTPDraftModel, MTPSpeculatorConfig
 from speculators.models.mtp.capabilities import get_mtp_capability
-from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.proposals import GreedyTokenProposalConfig
 
 FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "glm_mtp"
@@ -234,9 +231,7 @@ def test_glm_one_step_matches_single_step_wrapper_bitwise():
             loss_mask=batch["loss_mask"],
         )
     assert torch.equal(loss_dispatch, loss_wrapper)
-    assert torch.equal(
-        metrics_dispatch["loss_step_0"], metrics_wrapper["loss_step_0"]
-    )
+    assert torch.equal(metrics_dispatch["loss_step_0"], metrics_wrapper["loss_step_0"])
 
 
 def test_glm_short_sequence_with_five_steps_skips_not_crashes():

@@ -191,4 +191,3 @@ python -m speculators.train \
 ## 6. 未执行事项
 
 本交付稿没有启动教师服务或训练，也没有宣称五步 GLM MTP 已通过 parity。当前本地已补入递归 forward 草案；远程源码同步由 `apply_glm_mtp_v2_remote.sh` 完成，随后仍需做 vLLM 位置/KV 语义对齐和 NPU 验证。
-

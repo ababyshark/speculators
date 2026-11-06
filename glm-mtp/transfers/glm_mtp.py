@@ -1,12 +1,13 @@
 from pathlib import Path
-p=Path('remote_scripts/glm_mtp.py')
-s=p.read_text()
-old='''    output = model.mtp_layers[0](
+
+p = Path("remote_scripts/glm_mtp.py")
+s = p.read_text()
+old = """    output = model.mtp_layers[0](
         hidden, model.embed_tokens(input_ids[:, 1:-1].long()), attention_mask=mask,
         position_ids=pos, position_embeddings=model.rotary_emb(hidden, pos),
     )
-'''
-new='''    token_embeddings = model.embed_tokens(input_ids[:, 1:-1].long())
+"""
+new = """    token_embeddings = model.embed_tokens(input_ids[:, 1:-1].long())
     position_embeddings = model.rotary_emb(hidden, pos)
     # Attention and sparse-MoE activations dominate the NPU peak. Recompute the
     # complete MTP layer during backward when training, while retaining the
@@ -27,6 +28,6 @@ new='''    token_embeddings = model.embed_tokens(input_ids[:, 1:-1].long())
             hidden, token_embeddings, attention_mask=mask,
             position_ids=pos, position_embeddings=position_embeddings,
         )
-'''
+"""
 assert old in s
-p.write_text(s.replace(old,new))
+p.write_text(s.replace(old, new))

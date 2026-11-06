@@ -1,4 +1,5 @@
 """Serializable per-rank RNG state for restartable online training."""
+
 import random
 from contextlib import contextmanager
 
@@ -26,7 +27,9 @@ def restore_rng_state(state):
     np.random.set_state((name, np.asarray(values, dtype=np.uint32), *tail))
     torch.set_rng_state(state["torch"].cpu())
     if "device" in state:
-        torch.get_device_module(state["device_type"]).set_rng_state(state["device"].cpu())
+        torch.get_device_module(state["device_type"]).set_rng_state(
+            state["device"].cpu()
+        )
 
 
 @contextmanager

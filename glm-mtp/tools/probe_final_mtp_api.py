@@ -29,13 +29,21 @@ for prompt in prompts:
         body = response.json()
     except Exception:
         body = response.text
-    records.append({"prompt": prompt, "status": response.status_code, "elapsed_s": elapsed, "body": body})
+    records.append(
+        {
+            "prompt": prompt,
+            "status": response.status_code,
+            "elapsed_s": elapsed,
+            "body": body,
+        }
+    )
 print(json.dumps(records, ensure_ascii=False, indent=2))
 print("---METRICS---")
 metrics_text = requests.get(base + "/metrics", timeout=30).text
 print(metrics_text)
 Path = __import__("pathlib").Path
 Path("/workspace/tools/logs/final_acceptance_probe.json").write_text(
-    json.dumps({"records": records, "metrics": metrics_text}, ensure_ascii=False, indent=2)
+    json.dumps(
+        {"records": records, "metrics": metrics_text}, ensure_ascii=False, indent=2
+    )
 )
-

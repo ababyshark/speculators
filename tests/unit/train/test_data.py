@@ -935,7 +935,9 @@ def test_no_pack_env_selects_nopack_sampler_end_to_end(tmp_path, monkeypatch):
 
     manifest_path = _write_loader_fixture(tmp_path)
     monkeypatch.setattr(
-        __import__("speculators.train.dataloader", fromlist=["OfflineHiddenStatesSource"]),
+        __import__(
+            "speculators.train.dataloader", fromlist=["OfflineHiddenStatesSource"]
+        ),
         "OfflineHiddenStatesSource",
         _LoaderFakeSource,
     )

@@ -50,7 +50,9 @@ def _build_fixtures(tmp_path: Path):
     attn_q, attn_scale, _ = requant_int8(attn_logical)
 
     tensors = {
-        f"model.layers.{layer}.mlp.experts.0.gate_proj.weight": gate_packed.to(torch.int8),
+        f"model.layers.{layer}.mlp.experts.0.gate_proj.weight": gate_packed.to(
+            torch.int8
+        ),
         f"model.layers.{layer}.mlp.experts.0.gate_proj.weight_scale": gate_scale,
         f"model.layers.{layer}.mlp.experts.0.gate_proj.weight_offset": torch.ones(4, 1),
         f"model.layers.{layer}.mlp.experts.0.gate_proj.scale_bias": torch.ones(4, 1),
@@ -61,7 +63,7 @@ def _build_fixtures(tmp_path: Path):
         # a tensor OUTSIDE the MTP layer that must stay untouched
         "model.layers.0.self_attn.q_a_proj.weight": torch.full((4, 6), 3.0),
     }
-    weight_map = {k: "shard-a.safetensors" for k in tensors}
+    weight_map = dict.fromkeys(tensors, "shard-a.safetensors")
     save_file(tensors, str(target / "shard-a.safetensors"))
     (target / "quant_model_weights.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
@@ -72,10 +74,10 @@ def _build_fixtures(tmp_path: Path):
     # Trained (logical, float) tensors under the drafter key naming.
     save_file(
         {
-            f"mtp_layers.0.mlp.experts.0.gate_proj.weight": gate_logical,
-            f"mtp_layers.0.self_attn.q_a_proj.weight": attn_logical * 0.5,
-            f"mtp_layers.0.input_layernorm.weight": norm_float + 0.1,
-            f"mtp_layers.0.mlp.gate.e_score_correction_bias": router_bias + 0.1,
+            "mtp_layers.0.mlp.experts.0.gate_proj.weight": gate_logical,
+            "mtp_layers.0.self_attn.q_a_proj.weight": attn_logical * 0.5,
+            "mtp_layers.0.input_layernorm.weight": norm_float + 0.1,
+            "mtp_layers.0.mlp.gate.e_score_correction_bias": router_bias + 0.1,
         },
         str(trained / "model.safetensors"),
     )
@@ -89,13 +91,23 @@ def test_requant_writeback_produces_stored_layout(tmp_path):
     export.requant_writeback(trained, target, out, layer)
 
     with safe_open(str(out / "shard-a.safetensors"), framework="pt") as handle:
-        keys = set(handle.keys())  # noqa: SIM118
-        gate_codes = handle.get_tensor(f"model.layers.{layer}.mlp.experts.0.gate_proj.weight")
-        gate_scale = handle.get_tensor(f"model.layers.{layer}.mlp.experts.0.gate_proj.weight_scale")
-        attn_codes = handle.get_tensor(f"model.layers.{layer}.self_attn.q_a_proj.weight")
-        attn_scale = handle.get_tensor(f"model.layers.{layer}.self_attn.q_a_proj.weight_scale")
+        keys = set(handle.keys())
+        gate_codes = handle.get_tensor(
+            f"model.layers.{layer}.mlp.experts.0.gate_proj.weight"
+        )
+        gate_scale = handle.get_tensor(
+            f"model.layers.{layer}.mlp.experts.0.gate_proj.weight_scale"
+        )
+        attn_codes = handle.get_tensor(
+            f"model.layers.{layer}.self_attn.q_a_proj.weight"
+        )
+        attn_scale = handle.get_tensor(
+            f"model.layers.{layer}.self_attn.q_a_proj.weight_scale"
+        )
         norm = handle.get_tensor(f"model.layers.{layer}.input_layernorm.weight")
-        bias = handle.get_tensor(f"model.layers.{layer}.mlp.gate.e_score_correction_bias")
+        bias = handle.get_tensor(
+            f"model.layers.{layer}.mlp.gate.e_score_correction_bias"
+        )
         untouched = handle.get_tensor("model.layers.0.self_attn.q_a_proj.weight")
 
     # All keys preserved (codes + scale/offset/bias siblings + floats).
@@ -117,7 +129,7 @@ def test_requant_writeback_produces_stored_layout(tmp_path):
     assert torch.equal(gate_codes, expect_packed)
     assert torch.allclose(gate_scale, expect_scale)
     # dequantize round-trip stays close to the trained logical weights.
-    from speculators.convert.w4a8_layout import unpack_int4_dim0, to_signed_int4
+    from speculators.convert.w4a8_layout import unpack_int4_dim0
 
     dequant = unpack_int4_dim0(gate_codes) * gate_scale
     cos = torch.nn.functional.cosine_similarity(

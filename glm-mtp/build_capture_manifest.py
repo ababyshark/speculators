@@ -8,14 +8,17 @@ eagle_aux_hidden_state_layer_ids=[78]) captured the verifier layer-77 RAW
 output = PRE-final-norm, bf16. The training (fastmtp + the pre_norm stage)
 applies the frozen verifier_norm in-forward.
 """
+
 import glob
 import hashlib
 import sys
 
 import torch
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "src"))
-from speculators.models.mtp.capture import (  # noqa: E402
+sys.path.insert(
+    0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "src")
+)
+from speculators.models.mtp.capture import (
     build_capture_manifest,
     write_capture_manifest,
 )
@@ -61,10 +64,10 @@ def main():
         native_mtp_layer_index=78,
         native_mtp_key_prefix="model.layers.78.",
         capture_files=files,
-    model_norm_weight=norm_w,
-    # GLM-5.3 config.indexer_types is per-layer; the capture source layer
-    # (0-based 77 = ordinal 78) is 'shared'.
-    verifier_source_indexer_type="shared",
+        model_norm_weight=norm_w,
+        # GLM-5.3 config.indexer_types is per-layer; the capture source layer
+        # (0-based 77 = ordinal 78) is 'shared'.
+        verifier_source_indexer_type="shared",
         source_norm="model.norm",
         hidden_size=6144,
         dtype="bfloat16",

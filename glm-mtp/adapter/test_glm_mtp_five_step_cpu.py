@@ -3,6 +3,7 @@
 This does not load GLM weights. It validates the index arithmetic used by the
 NPU implementation before uploading the patch to the training container.
 """
+
 from __future__ import annotations
 
 
@@ -13,11 +14,13 @@ def ranges(seq_len: int, steps: int):
     out = []
     for step in range(steps):
         start = step + 1
-        out.append({
-            "hidden": (0, valid_len),
-            "tokens": (start, start + valid_len),
-            "labels": (start + 1, start + 1 + valid_len),
-        })
+        out.append(
+            {
+                "hidden": (0, valid_len),
+                "tokens": (start, start + valid_len),
+                "labels": (start + 1, start + 1 + valid_len),
+            }
+        )
     return out
 
 

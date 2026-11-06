@@ -27,9 +27,7 @@ from transformers import AutoConfig
 REPO = os.environ.get(
     "GLM53_REPO", "/mnt/share_space/l00840580/my-contributions/speculators"
 )
-WORKSPACE = os.environ.get(
-    "GLM53_WS", "/mnt/share_space/l00840580/dspark-glm53"
-)
+WORKSPACE = os.environ.get("GLM53_WS", "/mnt/share_space/l00840580/dspark-glm53")
 MODEL = os.environ.get("GLM53_MODEL", "/mnt/weight2/l00840580-glm53-w4a8-biasfix")
 WARMSTART = os.environ.get(
     "GLM53_WARMSTART", f"{WORKSPACE}/drafter_init/glm53-mtp-warmstart-signed"
@@ -99,18 +97,26 @@ def ctx():
     embed = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size).to(dev, torch.bfloat16)
     embed.weight.data = ws["embed_tokens.weight"].to(dev, torch.bfloat16)
     enorm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(dev, torch.bfloat16)
-    enorm.weight.data = ws["mtp_layers.0.token_layernorm.weight"].to(dev, torch.bfloat16)
+    enorm.weight.data = ws["mtp_layers.0.token_layernorm.weight"].to(
+        dev, torch.bfloat16
+    )
     hnorm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(dev, torch.bfloat16)
-    hnorm.weight.data = ws["mtp_layers.0.hidden_layernorm.weight"].to(dev, torch.bfloat16)
-    final_norm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(dev, torch.bfloat16)
-    final_norm.weight.data = ws["mtp_layers.0.final_layernorm.weight"].to(dev, torch.bfloat16)
+    hnorm.weight.data = ws["mtp_layers.0.hidden_layernorm.weight"].to(
+        dev, torch.bfloat16
+    )
+    final_norm = GlmMoeDsaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps).to(
+        dev, torch.bfloat16
+    )
+    final_norm.weight.data = ws["mtp_layers.0.final_layernorm.weight"].to(
+        dev, torch.bfloat16
+    )
     eh_w = ws["mtp_layers.0.input_proj.weight"].to(dev, torch.bfloat16)
     head_w = ws["lm_head.weight"].to(dev, torch.bfloat16)
 
     layer = GlmMoeDsaDecoderLayer(cfg, layer_idx=0).to(torch.bfloat16).to(dev)
     layer.eval()
     ws_layer = {
-        k[len("mtp_layers.0."):]: v
+        k[len("mtp_layers.0.") :]: v
         for k, v in ws.items()
         if k.startswith("mtp_layers.0.")
     }
@@ -174,7 +180,7 @@ def test_mixin_composition_matches_serving(ctx) -> None:
     mtp_layer = GlmMoeDsaMTPLayer(ctx["cfg"], layer_idx=0).to(torch.bfloat16).to(dev)
     mtp_layer.eval()
     ws_layer = {
-        k[len("mtp_layers.0."):]: v
+        k[len("mtp_layers.0.") :]: v
         for k, v in _load_dir(WARMSTART).items()
         if k.startswith("mtp_layers.0.")
     }
@@ -233,7 +239,9 @@ def test_argmax_diversity(ctx) -> None:
     argmax = stages["logits"].argmax(-1).cpu()
     vals, counts = argmax.unique(return_counts=True)
     top_frac = (counts.max().item()) / argmax.numel()
-    print(f"\nARGMAX-DIVERSITY: unique={len(vals)}/{argmax.numel()} top-token-frac={top_frac:.3f}")
+    print(
+        f"\nARGMAX-DIVERSITY: unique={len(vals)}/{argmax.numel()} top-token-frac={top_frac:.3f}"
+    )
     assert top_frac < 0.5, (
         f"argmax collapsed: {top_frac:.1%} of predictions are ONE token "
         f"(token {vals[counts.argmax()].item()}) — the model ignores its "

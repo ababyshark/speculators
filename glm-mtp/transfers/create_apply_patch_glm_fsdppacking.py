@@ -1,6 +1,8 @@
 from pathlib import Path
-p=Path('remote_scripts/apply_patch_glm_fsdppacking.py')
-p.write_text('''from pathlib import Path
+
+p = Path("remote_scripts/apply_patch_glm_fsdppacking.py")
+p.write_text(
+    '''from pathlib import Path
 p=Path("/workspace/speculators/src/speculators/train/distributed.py")
 s=p.read_text()
 old="""    for layer in model.layers:  # type: ignore[union-attr]
@@ -22,4 +24,6 @@ new="""    # GLM native MTP has one very large sparse-MoE layer. Shard attention
 """
 if old not in s: raise SystemExit("target not found")
 p.write_text(s.replace(old,new))
-''', encoding='utf-8')
+''',
+    encoding="utf-8",
+)

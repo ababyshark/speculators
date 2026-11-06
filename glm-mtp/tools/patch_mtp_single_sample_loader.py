@@ -1,8 +1,8 @@
 from pathlib import Path
 
-p=Path("/workspace/speculators/src/speculators/train/dataloader.py")
-s=p.read_text()
-old="""    batch_sampler = MultipackDistributedBatchSamplerV2(
+p = Path("/workspace/speculators/src/speculators/train/dataloader.py")
+s = p.read_text()
+old = """    batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
         lengths=dataset.approx_lengths,
         num_replicas=get_dp_size(),
@@ -11,7 +11,7 @@ old="""    batch_sampler = MultipackDistributedBatchSamplerV2(
         max_batches=max_batches,
     )
 """
-new="""    if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
+new = """    if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
         class _SingleSampleSampler:
             def __iter__(self):
                 indices = list(range(get_dp_rank(), len(dataset), get_dp_size()))
@@ -33,6 +33,6 @@ new="""    if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
         )
 """
 if new not in s:
-    assert s.count(old)==1
-    p.write_text(s.replace(old,new))
+    assert s.count(old) == 1
+    p.write_text(s.replace(old, new))
 print("single-sample loader patch applied")

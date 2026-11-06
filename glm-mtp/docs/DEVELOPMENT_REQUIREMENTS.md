@@ -1,10 +1,8 @@
 # GLM-5.3 原生 MTP 增训 —— 方案 B 开发需求说明书
 
-> 版本：v1.0（2026-11-03）
-> 适用场景：在一台**全新的开发/训练机**上，从零实现"薄适配层 + 上游组件 + 框架共享前向"的 GLM-5.3 MTP 训练路径。
-> 本文档自包含：不依赖任何对话上下文。所有"已核实"标注的事实均已对照源码确认，开发者直接引用，不要重新发现。
+> 版本：v1.0（2026-11-03） 适用场景：在一台**全新的开发/训练机**上，从零实现"薄适配层 + 上游组件 + 框架共享前向"的 GLM-5.3 MTP 训练路径。 本文档自包含：不依赖任何对话上下文。所有"已核实"标注的事实均已对照源码确认，开发者直接引用，不要重新发现。
 
----
+______________________________________________________________________
 
 ## 0. 一页速览
 
@@ -16,7 +14,7 @@
 
 **周期**：Gate 1（CPU 纯开发+测试）1.5-2 天；Gate 2（NPU 机器）3-5 天 + ~2 天机器时间。
 
----
+______________________________________________________________________
 
 ## 1. 背景
 
@@ -34,19 +32,19 @@ GLM-5.3 = `GlmMoeDsaForCausalLM`（transformers `model_type="glm_moe_dsa"`）：
 
 .23 全部材料的字节级归档：`glm_patch_bundle.tar.gz`（239KB，sha256 `1c5fd40906ed39bcf117c6c4cb9736f88cce73e6d295f80cd8e6916652ff594a`）。解压后目录见 §2.4。
 
----
+______________________________________________________________________
 
 ## 2. 环境与材料清单
 
 ### 2.1 软件基线（钉死，不许浮动）
 
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| 容器镜像 | `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3` | 含 vllm 0.30.0+empty / vllm-ascend 0.30.0rc2 / torch 2.10.0+cpu / python 3.12.13 |
-| transformers | **5.14.1** | 容器现役版本。✅ 已核实该版本 `GlmMoeDsaIndexer`/`GlmMoeDsaAttention` 支持 `past_key_values=None` 的无 cache 训练前向（attention_mask=None 时用 position_ids 自建因果掩码），**无需升级** |
-| speculators | checkout `7ed657f`（main） | 基线 commit |
-| torch_npu | 2.10.0.post7 | ⚠️ .23 用 post7；.26 容器自带 post4，**开工前核对并统一到 post7**（post7 wheel 曾��于 /tmp/torch_npu/，已不在，需另寻） |
-| venv 内追加 | datasets==5.1.0, numpy==2.2.6, pyarrow==26.0.0, setuptools-git-versioning | 完整清单见 bundle 内 `venv_packages.txt` |
+| 组件         | 版本                                                                      | 说明                                                                                                                                                                                      |
+| ------------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 容器镜像     | `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3`                                | 含 vllm 0.30.0+empty / vllm-ascend 0.30.0rc2 / torch 2.10.0+cpu / python 3.12.13                                                                                                          |
+| transformers | **5.14.1**                                                                | 容器现役版本。✅ 已核实该版本 `GlmMoeDsaIndexer`/`GlmMoeDsaAttention` 支持 `past_key_values=None` 的无 cache 训练前向（attention_mask=None 时用 position_ids 自建因果掩码），**无需升级** |
+| speculators  | checkout `7ed657f`（main）                                                | 基线 commit                                                                                                                                                                               |
+| torch_npu    | 2.10.0.post7                                                              | ⚠️ .23 用 post7；.26 容器自带 post4，**开工前核对并统一到 post7**（post7 wheel 曾��于 /tmp/torch_npu/，已不在，需另寻）                                                                   |
+| venv 内追加  | datasets==5.1.0, numpy==2.2.6, pyarrow==26.0.0, setuptools-git-versioning | 完整清单见 bundle 内 `venv_packages.txt`                                                                                                                                                  |
 
 环境搭建命令（NPU 训练机上）：
 
@@ -79,16 +77,16 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 
 ### 2.4 .23 归档内容（bundle/）
 
-| 路径 | 内容 | 用途 |
-|---|---|---|
-| `speculators_git.diff` | .23 对 7ed657f 的完整 diff（813 行） | **语义参照**：训练稳健性改动（FSDP/checkpointer/dataloader/trainer）部分**原样沿用**，见 §5 W4 |
-| `glm_mtp.py` | .23 的私有 GLM 层（237 行） | **parity 参照物**：Gate 1 逐位比对的基准实现 |
-| `tools/` | extract/convert/export 三脚本、install 接线、teacher 启动、parity compare 工具链、`test_glm_mtp_components.py`、`README_glm53_mtp_23.md`、formal100 脚本 | W3/W5/W7 的底稿；**test_glm_mtp_components.py 的堆叠变换代码直接复用** |
-| `adapter/` | teacher 扩展链（sorted SFA 确定性、final-norm hook、native capture）、v2 交付文档 | W5/W6 底稿 |
-| `formal100_train_command.txt` / `run.yaml` / `final100_verified.json` | formal100 完整 provenance | W7 复刻参数来源 |
-| `base_commit.txt` / `venv_packages.txt` | 基线与依赖记录 | 环境核对 |
+| 路径                                                                  | 内容                                                                                                                                                     | 用途                                                                                           |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `speculators_git.diff`                                                | .23 对 7ed657f 的完整 diff（813 行）                                                                                                                     | **语义参照**：训练稳健性改动（FSDP/checkpointer/dataloader/trainer）部分**原样沿用**，见 §5 W4 |
+| `glm_mtp.py`                                                          | .23 的私有 GLM 层（237 行）                                                                                                                              | **parity 参照物**：Gate 1 逐位比对的基准实现                                                   |
+| `tools/`                                                              | extract/convert/export 三脚本、install 接线、teacher 启动、parity compare 工具链、`test_glm_mtp_components.py`、`README_glm53_mtp_23.md`、formal100 脚本 | W3/W5/W7 的底稿；**test_glm_mtp_components.py 的堆叠变换代码直接复用**                         |
+| `adapter/`                                                            | teacher 扩展链（sorted SFA 确定性、final-norm hook、native capture）、v2 交付文档                                                                        | W5/W6 底稿                                                                                     |
+| `formal100_train_command.txt` / `run.yaml` / `final100_verified.json` | formal100 完整 provenance                                                                                                                                | W7 复刻参数来源                                                                                |
+| `base_commit.txt` / `venv_packages.txt`                               | 基线与依赖记录                                                                                                                                           | 环境核对                                                                                       |
 
----
+______________________________________________________________________
 
 ## 3. 目标架构（方案 B）
 
@@ -114,7 +112,7 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 
 **原则**：GLM 专属知识只出现在两处——`glm_glue.py`（层组合）和权重管线（key 映射 + 堆叠变换）。算法（loss/step weights/优化器/调度）全部走框架 generic 路径，不写一行 GLM loss。
 
----
+______________________________________________________________________
 
 ## 4. 已核实事实（开发依据，直接引用）
 
@@ -132,12 +130,12 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 
 **F6 key 映射（方案 B 版）**。native → 训练态（speculators 布局）：
 
-| native（`model.layers.78.` 前缀下） | 训练态 | 备注 |
-|---|---|---|
-| `self_attn.*`、`mlp.gate.*`、`mlp.shared_experts.*` | `mtp_layers.0.` + 同名 | **恒等**（子模块名与上游一致） |
-| `mlp.experts.{i}.gate_proj/up_proj/down_proj.weight` | `mtp_layers.0.mlp.experts.gate_up_proj` / `.down_proj` 堆叠 | §F5 |
-| `enorm.*` / `hnorm.*` / `eh_proj.weight` / `shared_head.norm.*` | `token_layernorm.*` / `hidden_layernorm.*` / `input_proj.weight` / `final_layernorm.*` | mixin 模块名 |
-| `shared_head.head.weight` → `lm_head.weight`；`embed_tokens.weight` → `embed_tokens.weight` | 顶层 2 张量 | **独立词表**（F7） |
+| native（`model.layers.78.` 前缀下）                                                         | 训练态                                                                                 | 备注                           |
+| ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------ |
+| `self_attn.*`、`mlp.gate.*`、`mlp.shared_experts.*`                                         | `mtp_layers.0.` + 同名                                                                 | **恒等**（子模块名与上游一致） |
+| `mlp.experts.{i}.gate_proj/up_proj/down_proj.weight`                                        | `mtp_layers.0.mlp.experts.gate_up_proj` / `.down_proj` 堆叠                            | §F5                            |
+| `enorm.*` / `hnorm.*` / `eh_proj.weight` / `shared_head.norm.*`                             | `token_layernorm.*` / `hidden_layernorm.*` / `input_proj.weight` / `final_layernorm.*` | mixin 模块名                   |
+| `shared_head.head.weight` → `lm_head.weight`；`embed_tokens.weight` → `embed_tokens.weight` | 顶层 2 张量                                                                            | **独立词表**（F7）             |
 
 **F7 独立词表（.23 最重要的语义发现）**。GLM MTP 的 `embed_tokens` 和 `shared_head.head` 与主模型**不同**（extract 时 sha256 比对不一致，已证实）。因此：不能用框架默认的"从 verifier 拷词表"；必须保留 .23 的 `mtp_shared_weights_path` 机制——config 加该字段（str），`load_verifier_shared_weights` 的 GLM 分支从该路径（native 提取目录）读这两个张量、shape 校验、`nn.Parameter(..., requires_grad=False)` 冻结加载。这 2 张量不进训练 checkpoint，export 时从 native 目录补回。**此部分 .23 代码原样移植**（bundle `glm_mtp.py:90-101`）。
 
@@ -147,7 +145,7 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 
 **F10 #1226 已合并的通用改动 GLM 免费获得**：监督位置 CE、TTT 语义、accept 指标、draft_tokens 契约。GLM 需要的增量只有一个 flag（坑 1）。
 
----
+______________________________________________________________________
 
 ## 5. 工作包分解
 
@@ -158,6 +156,7 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 **位置**：`src/speculators/models/mtp/glm_glue.py`
 
 **内容**：
+
 1. `GlmMTPRMSNorm(GlmMoeDsaRMSNorm)`：fp32 前向（`.float()` 计算、weight `.float()`、回 cast）——.23 现成（bundle `glm_mtp.py:11-15`），原样搬。理由：NPU bf16 RMSNorm 与 vLLM `AscendRMSNorm` 舍入不一致会毁 parity。
 2. `GlmMTPRotaryEmbedding(GlmMoeDsaRotaryEmbedding)`：`copy.deepcopy(config)` 后 `config.head_dim = config.qk_rope_head_dim`（rope 只作用于 64 维 rope 分量）。注意签名 `(config, device=None)` 保持 `device=None` 默认以兼容 `core.py` 单参构造。若 F4 的 `flatten_rope_parameters` 验证失败，在此类里从 config 直接读 `rope_parameters` dict。
 3. `GlmMTPLayer = _create_mtp_layer_class("GlmMTPLayer", GlmMoeDsaDecoderLayer, GlmMTPRMSNorm)` 之后的子类覆写，共 3 点：
@@ -176,6 +175,7 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 ### W2 注册与 core 分支（~55 行）
 
 **内容**：
+
 1. `model_definitions.py`：`mtp_model_classes["glm_moe_dsa"] = base_components.override_components("glm_moe_dsa", first_layer_class=GlmMTPLayer, norm_class=GlmMTPRMSNorm, rotary_emb_class=GlmMTPRotaryEmbedding)`。注意 `base_components.model_classes` 需先有 `glm_moe_dsa` 条目（若上游 base_components 无此 model_type，用 `ModelComponents(...)` 直接构造）。
 2. `config.py`（mtp 的）：`+ mtp_shared_weights_path: str | None = None`。
 3. `core.py`：
@@ -188,6 +188,7 @@ speculators 的 [PR #1226](https://github.com/vllm-project/speculators/pull/1226
 ### W3 权重管线三脚本（改造 `tools/` 底稿，~200 行改动）
 
 **extract_native_mtp.py**（底稿：bundle `tools/extract_native_mtp.py`）：
+
 - 保留：只读源、793 张量计数断言、浮点断言、finite 检查、分片写 + 读回 sha256 逐张量校验、独立词表对比报告（embed/lm_head vs 主模型，预期不一致）
 - **新增**：逐专家→3D 堆叠变换（F5 公式），变换后再做一次 sha256 校验；index 里写堆叠 key（训练态命名，F6 表）
 - 产物：`glm53_mtp_native/`（含 `model.safetensors.index.json` 用**训练态 key**——这样 convert 就是恒等复制）
@@ -234,47 +235,53 @@ export（W3 脚本）→ `vllm serve <exports_dir> --speculative_config '{"metho
 
 **验收**：trained 的 MAL **显著高于** step0 基线（.23 的 step0 基线 MAL ~1.9-2.0，训练后期望 ≥2.3；具体门限以 20 步 pilot 的趋势外推）。发布时附全套 provenance（train_command.txt / vllm_command.txt / checkpoint_sha256.txt / patches）。
 
----
+______________________________________________________________________
 
 ## 6. 阶段划分与 Go/No-Go
 
 ### 6.1 Gate 1（CPU，1.5-2 天）——先做这个
+
 W1 + W2 + W3 的 extract/convert 部分 + 单元测试。**不需要 NPU、不需要真实权重**（用 fake config + 随机权重；真实权重校验可用 sshfs 只读跑 extract 的校验逻辑）。
+
 - **Go 条件**：新层 vs .23 层 CPU parity 逐位通过；793→791+2 权重管线往返一致；`create_causal_mask`/`flatten_rope_parameters` 两个契约点验证通过
 - **No-Go 止损**：若 `create_causal_mask` 对 GlmMoeDsaConfig 不可用且无法在注册层修（比如需要改 masking_utils），保留 .23 的 `_glm_causal_mask`（10 行）作为 GLM 分支的 mask 来源——这是允许的兜底，不构成 No-Go。真正的 No-Go 只有：新层与 .23 层语义无法对齐（此时退回方案 A 照抄 .23，损失锁定在 Gate 1 的 2 天）
 
 ### 6.2 Gate 2（NPU 训练机，3-5 天 + 2 天机器时间）
+
 W4 → W5 parity → W6 阶梯 → W7 formal100 → W8 验收。
+
 - **Go/No-Go 门槛在 W5**：native parity 不过则停止，回到 Gate 1 排查
 
 ### 6.3 Phase 3（可选，1-2 周）：多步（num_speculative_steps 3-5）
+
 - 语义规格**照抄** #1226 `_ttt_mask_mod`/`_forward_ttt`（step-0 KV 只读 + 本链 KV；位置每步 +step）
 - 实现**必须替换** flex-attention（NPU 无）：物化 bool mask（8K×5 步 ~335MB 可承受）+ SDPA/eager
 - **indexer 多步语义是最大未知数**：先用 bundle `adapter/glm_mtp_native_capture_extension.py` 抓 vLLM native MTP 在 step≥1 的实际输入（input_ids/positions/topk_indices/hidden），compare 对齐后再写训练路径
 - MLA 的 `_TTTCache` 变体：GlmMoeDsaAttention 在 `past_key_values` 非 None 时 update 的是**展开后** KV（[B,H,S,qk_head_dim]/[B,H,S,v_head]）——cache 存展开 KV，5 步 ~1GB/层可承受
 - vLLM 端多步 KV 成本参考：社区报告 native MTP 5 steps KV 0.0922 MiB/token（speculators issue #1175）
 
----
+______________________________________________________________________
 
 ## 7. 坑清单（每一条都是 .23 真金白银踩出来的）
 
-1. **双重 norm**：teacher hook 已输出 final-norm 后张量（F9）；#1226 的 vllm 前向又会过 `verifier_norm`。GLM **必须跳过**（W2 的 flag）。备选：撤 hook 改用 trainer 侧 norm——不推荐（要额外提取 `model.norm.weight`、量化包 norm 可能带全零 bias、与 serving 时 bf16 norm 有数值差）。
-2. **indexer 加载后意外解冻**：meta 加载流程会恢复 requires_grad——加载完显式重冻结，且在测试里断言（W1）。
-3. **打包**：GLM 前向只接受未打包单序列。训练必须 `SPECULATORS_MTP_NO_PACK=1`、batch=1。数据 `document_ids` 断言只允许右 padding 单文档。
-4. **`loss_mask[:, 2:]` 可能为空**：2K 截断样本若无监督目标会 NaN——保留 .23 的过滤守卫（forward 里 valid_count clamp + 空 mask 提前返回零 loss）。
-5. **Ascend SFA 物理页序噪声**：teacher 端不排序就开训，parity 和训练本身都会被随机噪声污染——sorted_sfa 扩展链必须挂。
-6. **w4a8 量化包的 RMSNorm 可选 bias**：加载时摘除（native capture 扩展里的 `load_weights_with_optional_norm_bias` 已有实现）。
-7. **磁盘写回竞争**：.23 formal100 收尾 SIGBUS（XFS + 磁盘只剩 152G），模型 shard 写出但 training_state.json 停在 step20。开跑前清盘 ≥300G；checkpoint 频率 20 步起步，磁盘吃紧就拉大。
-8. **验收目录指向**（重复强调）：serving A/B 的 B 侧必须指向 export 产物并留 sha256 证据。
-9. **`--include-last-layer` off-by-one**（speculators issue #705）：`launch_vllm.py` 对 78 层模型会把 78 当最后层索引（应为 77）。.23 用 `--target-layer-ids 78` + hook 恰好绕开；**不要"修复"成 include-last-layer**，保持现状。
+01. **双重 norm**：teacher hook 已输出 final-norm 后张量（F9）；#1226 的 vllm 前向又会过 `verifier_norm`。GLM **必须跳过**（W2 的 flag）。备选：撤 hook 改用 trainer 侧 norm——不推荐（要额外提取 `model.norm.weight`、量化包 norm 可能带全零 bias、与 serving 时 bf16 norm 有数值差）。
+02. **indexer 加载后意外解冻**：meta 加载流程会恢复 requires_grad——加载完显式重冻结，且在测试里断言（W1）。
+03. **打包**：GLM 前向只接受未打包单序列。训练必须 `SPECULATORS_MTP_NO_PACK=1`、batch=1。数据 `document_ids` 断言只允许右 padding 单文档。
+04. **`loss_mask[:, 2:]` 可能为空**：2K 截断样本若无监督目标会 NaN——保留 .23 的过滤守卫（forward 里 valid_count clamp + 空 mask 提前返回零 loss）。
+05. **Ascend SFA 物理页序噪声**：teacher 端不排序就开训，parity 和训练本身都会被随机噪声污染——sorted_sfa 扩展链必须挂。
+06. **w4a8 量化包的 RMSNorm 可选 bias**：加载时摘除（native capture 扩展里的 `load_weights_with_optional_norm_bias` 已有实现）。
+07. **磁盘写回竞争**：.23 formal100 收尾 SIGBUS（XFS + 磁盘只剩 152G），模型 shard 写出但 training_state.json 停在 step20。开跑前清盘 ≥300G；checkpoint 频率 20 步起步，磁盘吃紧就拉大。
+08. **验收目录指向**（重复强调）：serving A/B 的 B 侧必须指向 export 产物并留 sha256 证据。
+09. **`--include-last-layer` off-by-one**（speculators issue #705）：`launch_vllm.py` 对 78 层模型会把 78 当最后层索引（应为 77）。.23 用 `--target-layer-ids 78` + hook 恰好绕开；**不要"修复"成 include-last-layer**，保持现状。
 10. **`rms_norm_eps` 必须读 config**（=1e-5），不许硬编码 1e-6。
 11. **kv dtype**：teacher 端 `--attention_config.indexer_kv_dtype int8` 是 parity 门限的一部分，不要动。
 
----
+______________________________________________________________________
 
 ## 8. 上游 PR 规约（如果决定把 W1/W2 提给 speculators）
 
 遵循仓库 `AGENTS.md`/`CONTRIBUTING.md`：
+
 - 读 `CONTRIBUTING.md`；装 dev 依赖后 `pre-commit install`
 - PR 模板：**Purpose** 1-3 句讲为什么（"GLM-5.3 ships a native MTP layer at model.layers.78; register it so MTP training works for glm_moe_dsa"），不重述 diff
 - **Tests**：给可运行命令（`pytest tests/unit/models/test_glm_mtp_glue.py -q`）+ 是否真跑过。**没跑过的数字不许写**
@@ -283,21 +290,21 @@ W4 → W5 parity → W6 阶梯 → W7 formal100 → W8 验收。
 - 任何 `launch_vllm.py` 使用都带 `--provenance-dir`；发布结果附 train_command.txt / vllm_command.txt / checkpoint_sha256.txt / patches 全套
 - 建议拆分：PR-1 = 注册 + glue 层 + CPU 测试（无 NPU 依赖，reviewer 可复现）；PR-2 = 权重管线脚本（或放 examples/）。#1226 若已合并则 rebase 到 main。
 
----
+______________________________________________________________________
 
 ## 9. 交付物清单
 
-| # | 交付物 | 形式 |
-|---|---|---|
-| D1 | speculators 开发分支（W1/W2/W4 + vendored #1226） | git 分支 + 可提 PR 的 commit 序列 |
-| D2 | 权重管线三脚本（W3） | 独立脚本 + 各自 `_report.json` |
-| D3 | 组件测试 + parity 测试 | pytest，全绿 |
-| D4 | NPU parity 记录（W5） | compare_glm 输出 + provenance |
-| D5 | formal100 run（W7） | checkpoint + train_command.txt + speculators.patch + run.yaml |
-| D6 | 验收 A/B 报告（W8） | MAL/acceptance 对比 + export_report sha256 证明 |
-| D7 | 本文档的执行记录 | 各 Gate 的 go/no-go 结论 |
+| #   | 交付物                                            | 形式                                                          |
+| --- | ------------------------------------------------- | ------------------------------------------------------------- |
+| D1  | speculators 开发分支（W1/W2/W4 + vendored #1226） | git 分支 + 可提 PR 的 commit 序列                             |
+| D2  | 权重管线三脚本（W3）                              | 独立脚本 + 各自 `_report.json`                                |
+| D3  | 组件测试 + parity 测试                            | pytest，全绿                                                  |
+| D4  | NPU parity 记录（W5）                             | compare_glm 输出 + provenance                                 |
+| D5  | formal100 run（W7）                               | checkpoint + train_command.txt + speculators.patch + run.yaml |
+| D6  | 验收 A/B 报告（W8）                               | MAL/acceptance 对比 + export_report sha256 证明               |
+| D7  | 本文档的执行记录                                  | 各 Gate 的 go/no-go 结论                                      |
 
----
+______________________________________________________________________
 
 ## 10. 快速参考：关键数字
 

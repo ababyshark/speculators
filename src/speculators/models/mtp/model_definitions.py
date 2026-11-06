@@ -150,7 +150,9 @@ Qwen3MTPLayer = _create_mtp_layer_class(
 )
 
 from speculators.models.mtp.glm_mtp import (
-    GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding,
+    GlmMTPLayer,
+    GlmMTPRMSNorm,
+    GlmMTPRotaryEmbedding,
 )
 
 mtp_model_classes: dict[str, base_components.ModelComponents] = {

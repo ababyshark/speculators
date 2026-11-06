@@ -49,7 +49,9 @@ def dequant_expert_weight(w, scale, zero_point_mode, scale_bias):
     scale_bias zero-point (the A/B gate for the vendor semantics)."""
     p16 = w.to(torch.int16)
     lo = torch.where((p16 & 0x0F) > 7, (p16 & 0x0F) - 16, (p16 & 0x0F)).float()
-    hi = torch.where(((p16 >> 4) & 0x0F) > 7, ((p16 >> 4) & 0x0F) - 16, ((p16 >> 4) & 0x0F)).float()
+    hi = torch.where(
+        ((p16 >> 4) & 0x0F) > 7, ((p16 >> 4) & 0x0F) - 16, ((p16 >> 4) & 0x0F)
+    ).float()
     nib = torch.stack([lo, hi], dim=1).reshape(scale.shape[0], w.shape[1])
     if zero_point_mode == "bias":
         return ((nib - scale_bias) * scale).bfloat16()
@@ -109,7 +111,7 @@ def main():
         with safe_open(shard, framework="pt", device="cpu") as sf:
             t = sf.get_tensor(k)
         suffix = k.rsplit(".", 1)[-1]
-        base = k[len(prefix):]
+        base = k[len(prefix) :]
         if suffix in ("weight_scale", "weight_offset", "scale_bias"):
             continue  # consumed by the weight dequant
         # the target_keys filter already dropped the 7 all-zero norm biases;
@@ -123,19 +125,23 @@ def main():
                 (c for c in (scale_k, scale_k.replace("weight_scale", "scale"))),
                 None,
             )
-            with safe_open(src_dir / weight_map[scale_key], framework="pt", device="cpu") as sf:
+            with safe_open(
+                src_dir / weight_map[scale_key], framework="pt", device="cpu"
+            ) as sf:
                 scale = sf.get_tensor(scale_key).float()
             bias_k = k.rsplit(".", 1)[0] + ".scale_bias"
             bias = None
             if bias_k in weight_map and args.zero_point_mode == "bias":
-                with safe_open(src_dir / weight_map[bias_k], framework="pt", device="cpu") as sf:
+                with safe_open(
+                    src_dir / weight_map[bias_k], framework="pt", device="cpu"
+                ) as sf:
                     bias = sf.get_tensor(bias_k).float()
-            if (
-                t.shape[0] * 2 == scale.shape[0]
-            ):  # int4 packed
+            if t.shape[0] * 2 == scale.shape[0]:  # int4 packed
                 if bias is None:
                     bias = torch.ones_like(scale)  # no-op subtraction
-                tensors[k] = dequant_expert_weight(t, scale, args.zero_point_mode, bias).contiguous()
+                tensors[k] = dequant_expert_weight(
+                    t, scale, args.zero_point_mode, bias
+                ).contiguous()
                 stats["int4"] += 1
             else:
                 w = dequant_tensor(t, scale)
@@ -180,7 +186,11 @@ def main():
     (out / "model.safetensors.index.json").write_text(
         json.dumps(
             {
-                "metadata": {"total_size": sum(t.numel() * t.element_size() for t in tensors.values())},
+                "metadata": {
+                    "total_size": sum(
+                        t.numel() * t.element_size() for t in tensors.values()
+                    )
+                },
                 "weight_map": {k: r["shard"] for k, r in records.items()},
             }
         )

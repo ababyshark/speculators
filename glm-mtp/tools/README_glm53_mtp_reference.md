@@ -24,18 +24,18 @@
 
 ## 重要路径
 
-| 用途 | 容器路径 |
-| --- | --- |
-| 原始权重 | `/data1/weight/GLM-5.3-w4a8-spec` |
-| 原生 MTP 提取 | `/data1/mtp_training/weights/glm53_mtp_native_step0` |
-| Speculators 转换产物 | `/data1/mtp_training/weights/glm53_mtp_speculators_step0` |
-| 隔离 Python 环境 | `/data1/mtp_training/venv` |
-| Speculators 源码 | `/workspace/speculators` |
-| GLM 适配模块 | `/workspace/speculators/src/speculators/models/mtp/glm_mtp.py` |
-| 启动与验证脚本 | `/workspace/tools` |
-| 日志 | `/workspace/tools/logs` |
-| 数据校验报告 | `/data1/mtp_training/provenance/dataset_audit.json` |
-| 教师在线缓存 | `/data1/mtp_training/teacher/hidden_states` |
+| 用途                 | 容器路径                                                       |
+| -------------------- | -------------------------------------------------------------- |
+| 原始权重             | `/data1/weight/GLM-5.3-w4a8-spec`                              |
+| 原生 MTP 提取        | `/data1/mtp_training/weights/glm53_mtp_native_step0`           |
+| Speculators 转换产物 | `/data1/mtp_training/weights/glm53_mtp_speculators_step0`      |
+| 隔离 Python 环境     | `/data1/mtp_training/venv`                                     |
+| Speculators 源码     | `/workspace/speculators`                                       |
+| GLM 适配模块         | `/workspace/speculators/src/speculators/models/mtp/glm_mtp.py` |
+| 启动与验证脚本       | `/workspace/tools`                                             |
+| 日志                 | `/workspace/tools/logs`                                        |
+| 数据校验报告         | `/data1/mtp_training/provenance/dataset_audit.json`            |
+| 教师在线缓存         | `/data1/mtp_training/teacher/hidden_states`                    |
 
 ## 脚本与使用范围
 

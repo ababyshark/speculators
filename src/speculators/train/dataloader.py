@@ -79,7 +79,9 @@ def _setup_dataloader(
         # and shards it deterministically; the packing collate then sees a
         # single document per batch, keeping the K=1 offset-slicing
         # semantics visible (batch_size=1).
-        batch_sampler: MultipackDistributedBatchSamplerV2 | NoPackDistributedBatchSampler = NoPackDistributedBatchSampler(
+        batch_sampler: (
+            MultipackDistributedBatchSamplerV2 | NoPackDistributedBatchSampler
+        ) = NoPackDistributedBatchSampler(
             lengths=dataset.approx_lengths,
             num_replicas=get_dp_size(),
             rank=get_dp_rank(),

@@ -247,8 +247,12 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
 
         if tc.model_type == "glm_moe_dsa":
             self._keep_in_fp32_modules_strict = {
-                "input_layernorm", "post_attention_layernorm", "q_a_layernorm",
-                "kv_a_layernorm", "k_norm", "e_score_correction_bias",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "q_a_layernorm",
+                "kv_a_layernorm",
+                "k_norm",
+                "e_score_correction_bias",
             }
         # Per-model policy (stage/freeze/ignore-keys) travels on a capability
         # object so core.py never contains model-specific key rules.
@@ -301,6 +305,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             if not self.config.mtp_shared_weights_path:
                 raise ValueError("GLM requires its independent MTP shared weights")
             from speculators.models.mtp.glm_mtp import load_native_shared_weights
+
             load_native_shared_weights(self)
             return
         with torch.no_grad():
@@ -448,7 +453,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         loss_mask: torch.Tensor | None = None,
         step_weights: list[float] | None = None,
         return_dict: bool = True,  # noqa: ARG002
-        **kwargs: Any,  # noqa: ARG002
+        **kwargs: Any,
     ) -> tuple:
         """Forward pass for MTP multi-token prediction (teacher-forced).
 
@@ -481,10 +486,15 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             # recursion. The single-step path remains available explicitly
             # via forward_glm_single_step (the .23-validated K=1 contract).
             from speculators.models.mtp.glm_mtp import forward_glm_mtp
+
             kwargs.pop("num_speculative_steps", None)  # never batch-overridden
             return forward_glm_mtp(
-                self, input_ids, hidden_states, attention_mask=attention_mask,
-                position_ids=position_ids, loss_mask=loss_mask,
+                self,
+                input_ids,
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                loss_mask=loss_mask,
                 step_weights=step_weights,
                 num_speculative_steps=self.config.num_speculative_steps,
                 **kwargs,

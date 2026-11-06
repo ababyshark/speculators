@@ -1,9 +1,8 @@
 # GLM-5.3 原生 MTP 增训补丁 —— 实现详解与重现指南
 
-> 来源：`.23`（POD1-A3-23，172.18.32.23）容器 `vllm_030_mtp_train`（镜像 `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3`）内 `/workspace/speculators` 工作树 + `/workspace/code_mtp`、`/workspace/code2` 脚本目录，2026-11-02/03 已端到端跑通 100 步正式训练。
-> 本地归档：`glm53_mtp_patch_study/bundle/`（字节级 tar 包 `glm_patch_bundle.tar.gz`，sha256 `1c5fd40906ed39bcf117c6c4cb9736f88cce73e6d295f80cd8e6916652ff594a`）。
+> 来源：`.23`（POD1-A3-23，172.18.32.23）容器 `vllm_030_mtp_train`（镜像 `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3`）内 `/workspace/speculators` 工作树 + `/workspace/code_mtp`、`/workspace/code2` 脚本目录，2026-11-02/03 已端到端跑通 100 步正式训练。 本地归档：`glm53_mtp_patch_study/bundle/`（字节级 tar 包 `glm_patch_bundle.tar.gz`，sha256 `1c5fd40906ed39bcf117c6c4cb9736f88cce73e6d295f80cd8e6916652ff594a`）。
 
----
+______________________________________________________________________
 
 ## 0. 一页总览
 
@@ -25,36 +24,36 @@
 
 ### 0.2 版本基线（重现时必须对齐）
 
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| 容器镜像 | `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3` | Python 3.12.13 |
-| speculators 基线 | **`7ed657f`**（main，"Async dataloader (#1310)"，版本号 0.10.0a28） | 所有改动叠加在此 commit 之上 |
-| vllm / vllm-ascend | 0.30.0+empty / 0.30.0rc2 | vLLM 侧含 `extract_hidden_states` + `ExampleHiddenStatesConnector` |
-| torch / torch_npu | 2.10.0+cpu / **2.10.0.post7**（venv 内） | ⚠️ .26 容器是 post4，需核对 |
-| transformers | 5.14.1 | 必须含 `transformers.models.glm_moe_dsa.modeling_glm_moe_dsa` |
-| datasets / numpy / pyarrow | 5.1.0 / 2.2.6 / 26.0.0（venv 内） | 只装 venv，全局不动 |
-| verifier 权重 | `GLM-5.3-w4a8-spec`（106 分片，含原生 MTP 层） | Ascend w4a8 量化包，MTP 张量本身是浮点 |
+| 组件                       | 版本                                                                | 说明                                                               |
+| -------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| 容器镜像                   | `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3`                          | Python 3.12.13                                                     |
+| speculators 基线           | **`7ed657f`**（main，"Async dataloader (#1310)"，版本号 0.10.0a28） | 所有改动叠加在此 commit 之上                                       |
+| vllm / vllm-ascend         | 0.30.0+empty / 0.30.0rc2                                            | vLLM 侧含 `extract_hidden_states` + `ExampleHiddenStatesConnector` |
+| torch / torch_npu          | 2.10.0+cpu / **2.10.0.post7**（venv 内）                            | ⚠️ .26 容器是 post4，需核对                                        |
+| transformers               | 5.14.1                                                              | 必须含 `transformers.models.glm_moe_dsa.modeling_glm_moe_dsa`      |
+| datasets / numpy / pyarrow | 5.1.0 / 2.2.6 / 26.0.0（venv 内）                                   | 只装 venv，全局不动                                                |
+| verifier 权重              | `GLM-5.3-w4a8-spec`（106 分片，含原生 MTP 层）                      | Ascend w4a8 量化包，MTP 张量本身是浮点                             |
 
 ### 0.3 补丁全景（12 个已跟踪文件改动 + 5 个新文件）
 
-| 类别 | 文件 | 作用 |
-|---|---|---|
-| **核心新文件** | `src/speculators/models/mtp/glm_mtp.py`（237 行） | GLM MTP 全部组件 + 训练 forward + key 映射 |
-| 新文件 | `src/speculators/train/rng_state.py`（44 行） | per-rank RNG 保存/恢复 + 固定 seed 验证上下文 |
-| 框架接线 | `models/mtp/config.py` | + `mtp_shared_weights_path` |
-| 框架接线 | `models/mtp/model_definitions.py` | 注册 `glm_moe_dsa` |
-| 框架接线 | `models/mtp/core.py` | fp32 严格模块集合；GLM 加载分支；GLM forward 分发 |
-| 框架接线 | `models/mtp/data.py` | `shift_batch_mtp` 透传 `document_ids`、`lengths` 变可选 |
-| 训练稳健性 | `train/checkpointer.py` | fp32 默认落盘；分片加载；不隐式换 dtype |
-| 训练稳健性 | `train/cli.py` + `train/config/schema.py` | `deterministic_algorithms`、`eval_only`、`eval_before_train`、`max_val_batches` |
-| 训练稳健性 | `train/dataloader.py` | `SPECULATORS_MTP_NO_PACK=1` 单样本采样器 |
-| 训���稳健性 | `train/distributed.py` | GLM 细粒度 FSDP；reduce dtype 可配 |
-| 训练稳健性 | `train/trainer.py` | fp32 master 参数；RNG 断点续训；mid-epoch 语义修复 |
-| 传输 | `hs_connectors/transfer.py` | `--hidden-states-lock-timeout` |
+| 类别           | 文件                                              | 作用                                                                            |
+| -------------- | ------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **核心新文件** | `src/speculators/models/mtp/glm_mtp.py`（237 行） | GLM MTP 全部组件 + 训练 forward + key 映射                                      |
+| 新文件         | `src/speculators/train/rng_state.py`（44 行）     | per-rank RNG 保存/恢复 + 固定 seed 验证上下文                                   |
+| 框架接线       | `models/mtp/config.py`                            | + `mtp_shared_weights_path`                                                     |
+| 框架接线       | `models/mtp/model_definitions.py`                 | 注册 `glm_moe_dsa`                                                              |
+| 框架接线       | `models/mtp/core.py`                              | fp32 严格模块集合；GLM 加载分支；GLM forward 分发                               |
+| 框架接线       | `models/mtp/data.py`                              | `shift_batch_mtp` 透传 `document_ids`、`lengths` 变可选                         |
+| 训练稳健性     | `train/checkpointer.py`                           | fp32 默认落盘；分片加载；不隐式换 dtype                                         |
+| 训练稳健性     | `train/cli.py` + `train/config/schema.py`         | `deterministic_algorithms`、`eval_only`、`eval_before_train`、`max_val_batches` |
+| 训练稳健性     | `train/dataloader.py`                             | `SPECULATORS_MTP_NO_PACK=1` 单样本采样器                                        |
+| 训���稳健性    | `train/distributed.py`                            | GLM 细粒度 FSDP；reduce dtype 可配                                              |
+| 训练稳健性     | `train/trainer.py`                                | fp32 master 参数；RNG 断点续训；mid-epoch 语义修复                              |
+| 传输           | `hs_connectors/transfer.py`                       | `--hidden-states-lock-timeout`                                                  |
 
 完整 diff 见 `bundle/speculators_git.diff`（813 行，267 insertions / 61 deletions）。
 
----
+______________________________________________________________________
 
 ## 1. 为什么官方 speculators MTP 流程跑不了 GLM-5.3
 
@@ -271,25 +270,31 @@ def load_native_shared_weights(model):
 ## 4. speculators 框架侧改动逐文件说明
 
 ### 4.1 `models/mtp/config.py`（+4 行）
+
 新增 `mtp_shared_weights_path: str | None`——指向 native 提取目录（convert 时写入 config，训练加载时读）。
 
 ### 4.2 `models/mtp/model_definitions.py`（+7 行）
+
 ```python
 from speculators.models.mtp.glm_mtp import (GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding)
 mtp_model_classes["glm_moe_dsa"] = base_components.ModelComponents(
     GlmMTPLayer, GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding)
 ```
+
 `model_type` 从 verifier config 自动解析（`AutoConfig` → `model_type: "glm_moe_dsa"`），注册后 `MTPDraftModel` 直接实例化 GLM 组件。
 
 ### 4.3 `models/mtp/core.py`（+25 行）
+
 1. `glm_moe_dsa` 的 `_keep_in_fp32_modules_strict` 集合（§3.1 列的 6 个模块名）。
 2. `load_verifier_shared_weights` 开头加 GLM 分支：无 `mtp_shared_weights_path` 即 raise；否则 `load_native_shared_weights(self)` 后直接 return。
 3. `forward` 开头加 GLM 分支：dispatch 到 `forward_glm_single_step`。
 
 ### 4.4 `models/mtp/data.py`（+3/-1 行）
+
 `shift_batch_mtp` 原来硬读 `batch["lengths"]`，但新 collator 已不再产出该字段（继承源码的接口不匹配，README 修复记录 4）。改为：`lengths` 存在才透传；`document_ids` 存在才透传（GLM forward 用它做打包边界断言）。
 
 ### 4.5 `train/dataloader.py`（+31 行）—— 单样本采样器
+
 ```python
 if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
     class _SingleSampleSampler:
@@ -298,9 +303,11 @@ if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
             if max_batches is not None: indices = indices[:max_batches]
             return iter(([i] for i in indices))                                # batch=1
 ```
+
 GLM forward 只接受未打包单序列 → 训练必须 `SPECULATORS_MTP_NO_PACK=1`。另外 `DataLoader(..., generator=torch.Generator().manual_seed(seed))` 固定加载器 RNG；`max_val_batches` 传给 val loader（formal100 用 `--max-val-batches 1`，验证只跑 1 个 batch，指标是 smoke 级估计）。
 
 ### 4.6 `train/distributed.py`（+17 行）—— 细粒度 FSDP（本补丁最关键的显存改动）
+
 ```python
 reduce_name = os.environ.get("SPECULATORS_FSDP_REDUCE_DTYPE", "float32")  # formal100 用 bf16
 mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
@@ -313,9 +320,11 @@ for layer in model.layers:
     fully_shard(layer, mp_policy=mp_policy)             # 再包整层
 fully_shard(model, mp_policy=mp_policy)
 ```
+
 为什么：GLM MTP 是"一个巨大的稀疏 MoE 层"，整层 all-gather 会在反向时把 256 个专家参数整体拉到每张卡——512/2K 试跑因此连续 OOM。先分片 attention/router/shared expert/每个 routed expert，再包外层 MTP layer，三种长度（512/2K/8K）都能反向（README 修复记录）。
 
 ### 4.7 `train/trainer.py`（+90 行）—— 精度与断点语义
+
 - **参数 dtype 策略**（构造函数里）：`requires_grad` 的参数 `.to(torch.float32)`（fp32 master，配 adamw eager），冻结参数 `.to(hidden_states_dtype)`（bf16 压缩）。冻结大头是 indexer 和词表。
 - **RNG 断点续训**：`_save_rng_state` 每个 rank 写 `rng_state_rank{rank}.pt`（python/numpy/torch/NPU 设备 RNG 全量）；resume 时恢复，警告"无 RNG 状态则续训不精确"。配套新文件 `rng_state.py`。
 - **验证确定性**：`val_epoch` 包在 `validation_rng(seed=0)` 里（验证前固定 seed、验证后还原），`batch_sampler.set_epoch(0)`——两次验证可比。
@@ -323,22 +332,26 @@ fully_shard(model, mp_policy=mp_policy)
 - ⚠️ 已知残留：formal100 收尾时 rank0 SIGBUS（XFS 写回竞争，当时 /data1 只剩 152G），模型 shard 已写出但 `training_state.json` 停在 step20——**复现长跑前先清盘 + 落盘节奏放慢**。
 
 ### 4.8 `train/checkpointer.py`（47 行改动）
+
 - 默认保存 dtype **bf16→fp32**（配 fp32 master）。
 - `load_safetensors_state_dict` 支持 `.index.json` 分片 checkpoint（native 提取目录就是分片的）。
 - 加载一律走 CPU、不做隐式 dtype 转换（`float_dtype is not None` 才转）——防止优化器状态被 FSDP 参数 dtype 污染。
 
 ### 4.9 `train/cli.py` + `train/config/schema.py`（50 行）
+
 - `set_seed(..., deterministic_algorithms)` → `torch.use_deterministic_algorithms(True)`（NPU 算子不支持会直接报错，比 silently 错强）。
 - `build_draft_model` 的 `from_pretrained(..., dtype=torch.float32)`——draft 全 fp32 初始化（后续 Trainer 再压冻结部分）。
 - 新 CLI 字段：`--max-val-batches`、`--eval-only`（只评估写 `save_path/evaluation/metrics.json`）、`--eval-before-train`、`--deterministic-algorithms`。
 - provenance：`cfg.save()` 在 eval_only 时写到 `save_path/evaluation`。
 
 ### 4.10 `hs_connectors/transfer.py`（47 行）
+
 `--hidden-states-lock-timeout`（默认 10s，formal100 传 180）：teacher 返回 HTTP 响应后 safetensors 是**异步落盘**的，训练端要按 `.lock` 文件等；没有上限的 `wait_for_lock` 会在 teacher 卡死时把训练一起挂死。FP8 backend 复用 File backend 的参数。
 
 ## 5. 权重三段流水线（convert → train → export）
 
 ### 5.1 `extract_native_mtp.py` —— 从量化包提取原生 MTP（只读不写源）
+
 ```
 source: /data1/weight/GLM-5.3-w4a8-spec   (quant_model_weights.safetensors.index.json)
 keys  : model.layers.78.*  → 必须恰好 793 个
@@ -352,6 +365,7 @@ keys  : model.layers.78.*  → 必须恰好 793 个
 ```
 
 ### 5.2 `convert_glm_mtp.py` —— 提取物 → Speculators checkpoint
+
 ```
 1. MTPSpeculatorConfig(
      transformer_layer_config = AutoConfig.from_pretrained(提取目录),   # glm_moe_dsa
@@ -367,6 +381,7 @@ keys  : model.layers.78.*  → 必须恰好 793 个
 ```
 
 ### 5.3 `export_glm_mtp_for_vllm.py` —— 训练 checkpoint → vLLM 可服务目录
+
 ```
 1. reverse_key: mtp_layers.0.* → model.layers.78.*（enorm/hnorm/eh_proj/shared_head.norm 逆映射）
 2. 断言: 训练 791 张量 + 2 共享张量 == native index 793（缺的必须恰好是 embed_tokens 和 shared_head.head）
@@ -383,6 +398,7 @@ keys  : model.layers.78.*  → 必须恰好 793 个
 ## 6. Teacher 隐状态服务（vLLM 侧）
 
 ### 6.1 启动命令（`tools/start_glm_mtp_teacher.sh`）
+
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONPATH="/workspace/code_mtp:/workspace/code2"          # teacher 扩展链在这两个目录
@@ -407,7 +423,9 @@ python scripts/launch_vllm.py train /data1/weight/GLM-5.3-w4a8-spec \
   --attention_config.indexer_kv_dtype int8 \
   --no-enable-prefix-caching --enforce-eager
 ```
+
 `launch_vllm.py train`（provenance 按容器内 AGENTS.md 约定带 `--provenance-dir`）自动注入：
+
 ```json
 --speculative_config {"method":"extract_hidden_states","num_speculative_tokens":1,
                       "draft_model_config":{"hf_config":{"eagle_aux_hidden_state_layer_ids":[78]}}}
@@ -416,6 +434,7 @@ python scripts/launch_vllm.py train /data1/weight/GLM-5.3-w4a8-spec \
 ```
 
 ### 6.2 `GLMMTPTeacher` 扩展链（三层，全部 import 副作用生效）
+
 1. `glm_teacher_worker_extension.GLMMTPTeacher` 基类 `GLMTeacherDeterminism`：import 即 `torch.use_deterministic_algorithms(True)`——每个 spawn 出来的 worker 都要执行一次。
 2. `glm_teacher_sorted_sfa_extension`：import 时给 `AscendSFAImpl._execute_sparse_flash_attention_process` 打补丁，进 sparse flash attention 前用 `sort_sparse_indices`（`glm_sfa_determinism.py`：把 topk 索引按逻辑位置升序、-1 padding 沉底）排序。原因：**Ascend 稀疏注意力的舍入结果依赖物理 KV 页顺序**，同样一组逻辑 token 不同页排布会出不同浮点值，parity 会被随机噪声毁掉。
 3. `glm_mtp_teacher_extension.GLMMTPTeacher`：包装 `NPUWorker.load_model`，加载后断言 `uses_extract_hidden_states()` 且 PP==1，给模型挂 forward hook：
@@ -427,6 +446,7 @@ python scripts/launch_vllm.py train /data1/weight/GLM-5.3-w4a8-spec \
    **这是 teacher 语义的核心修正**：`--target-layer-ids 78` 的原生 capture 语义抓的是第 78 层（最后主层）的原始输出；而 GLM 原生 MTP 吃的是 `model.norm` **之后**的 hidden。hook 把连接器送出去的张量换成 final-norm 输出，与 `AscendDeepSeekMTP` 的输入语义对齐（probe + compare_teacher_inputs 验证）。
 
 ### 6.3 Parity 验证（重现时不可省）
+
 - `start_glm_mtp_native_parity.sh` + `request_glm_mtp_native_4096.py`：起一个**带原生 deepseek_mtp 投机解码**的服务（`--speculative_config {"method":"deepseek_mtp",...}`），用 `glm_mtp_native_capture_extension.GLMMTPTeacher`（在 native MTP forward 前后抓 input_ids/positions/teacher_hidden/pre/post 输出/topk_indices）。
 - `compare_glm_mtp_native.py` / `compare_glm_mtp_chunk4096.py`：同一批请求下，训练适配器前向 vs native vLLM MTP 前向逐张量比对（4096 chunk）。
 - 附加发现（native capture 扩展里的 `load_weights_with_optional_norm_bias`）：主模型量化会给 RMSNorm 全局分配可选 bias，MTP 的 norm 没有对应权重 → 加载后把全零 bias 显式摘除，否则 forward 数值不纯。
@@ -434,6 +454,7 @@ python scripts/launch_vllm.py train /data1/weight/GLM-5.3-w4a8-spec \
 ## 7. 训练启动（实测脚本要点）
 
 `tools/train_glm_mtp_formal100_8k.sh`（与 pilot20 的差异：reduce dtype、max-steps、checkpoint 节奏）：
+
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 export HCCL_CONNECT_TIMEOUT=3600 HCCL_BUFFSIZE=200
@@ -464,6 +485,7 @@ python -m torch.distributed.run --nproc_per_node=8 -m speculators.train \
 ```
 
 实测数据（8-epoch 之外的 MTP formal100，2026-11-02/03）：
+
 - 数据：`prepared_8k_dflash2_official`（22,070 条 8K，train 19,875 / val 2,195；`train_data_ratio=0.9005663797009516` 保证切分点重合；来源 DFlash2 官方 8k 管线）
 - 100 步：loss 0.503→0.380，token accuracy 0.887；验证 loss 0.369 / acc 0.868（1 个 val batch）
 - 峰值显存 23.2–23.4 GB/卡；checkpoint ~112GB（fp32 全量 + optimizer）
@@ -471,23 +493,25 @@ python -m torch.distributed.run --nproc_per_node=8 -m speculators.train \
 
 ## 8. 精度与确定性策略（一条线贯穿全补丁）
 
-| 层 | 手段 |
-|---|---|
+| 层           | 手段                                                                                                           |
+| ------------ | -------------------------------------------------------------------------------------------------------------- |
 | Teacher 前向 | `--enforce-eager`、SFA 索引排序、`torch.use_deterministic_algorithms(True)`、`LCCL_DETERMINISTIC=1`、seed 1024 |
-| 数据 | 单样本采样器 + 固定 DataLoader generator + `validation_rng(seed=0)` |
-| 训练前向 | fp32 RMSNorm、indexer 冻结、chunk-loss fp32 CE |
-| 优化 | fp32 master 参数 + adamw eager + fp32/bf16 可选梯度归约 |
-| 落盘/恢复 | fp32 checkpoint、per-rank RNG 状态、CPU 加载不换 dtype |
-| 断点续训 | mid-epoch local_step + training_state.json + scheduler 重建（DSpark 归档验证过同套机制） |
+| 数据         | 单样本采样器 + 固定 DataLoader generator + `validation_rng(seed=0)`                                            |
+| 训练前向     | fp32 RMSNorm、indexer 冻结、chunk-loss fp32 CE                                                                 |
+| 优化         | fp32 master 参数 + adamw eager + fp32/bf16 可选梯度归约                                                        |
+| 落盘/恢复    | fp32 checkpoint、per-rank RNG 状态、CPU 加载不换 dtype                                                         |
+| 断点续训     | mid-epoch local_step + training_state.json + scheduler 重建（DSpark 归档验证过同套机制）                       |
 
 ## 9. 已验证结论 vs 未完成项（重现者必读）
 
 **已验证（.23 实测）**：
+
 - 提取/转换 793 张量逐位哈希一致；CPU/NPU 组件测试全过（分块 indexer top-k、专家前向/梯度、首位置 embedding 屏蔽、indexer 冻结、RoPE 维度、norm eps）。
 - 完整 MTP 权重 NPU 前向冒烟（峰值 22.1GiB）；512/2K/8K 单步反向 + 各 20 步连续 + 8K checkpoint 恢复读进 step21。
 - formal100：100 次有效更新、模型 shard 写出、独立加载冒烟通过。
 
 **未完成/已知问题**：
+
 1. **单步限制**：`--num-speculative-steps 1` 是唯一 parity 过的配置；5 步递归 forward 是草案（CODE_DELIVERY v2 §3.3），vLLM 多步 KV/位置语义未对齐，**不许直接调大**。
 2. **正式 stitch 未接**：出口是自定义 export，官方 `stitch-mtp` 不兼容。
 3. **验收 A/B 实际无效（本次复盘新发现）**：`stitched_final100/` 目录全部文件时间戳是 11-02 14:10 CST——**早于 formal100 训练开始（23:57 CST）**。`start_final_mtp_service.sh` 加载的是这个**训练前**的快照，所以 final vs baseline 探针数字几乎相同（MAL 1.90–2.00 vs 1.95–2.00）是"step0 vs step0"。真正的训练产物在 `exports/final100_vllm/`（11-03 04:02，791+2 张量），**从未被服务加载过**。重跑验收时必须把服务指向 exports 目录（或重新做 stitch），A/B 结论才有意义。
@@ -529,15 +553,15 @@ python -m torch.distributed.run --nproc_per_node=8 -m speculators.train \
 
 ## 11. 本地归档索引（`glm53_mtp_patch_study/bundle/`）
 
-| 文件 | 内容 |
-|---|---|
-| `speculators_git.diff` | 12 文件完整 diff（813 行）——框架侧改动的唯一权威来源 |
-| `glm_mtp.py` / `rng_state.py` | 两个新文件原样拷贝 |
-| `base_commit.txt` / `git_status.txt` | 基线 commit 7ed657f 与工作树状态 |
-| `tools/` | 运行现场：extract/convert/export、install 接线、teacher/parity/验收脚本、README_glm53_mtp_23.md、formal100_train_command.txt、run.yaml |
-| `adapter/` | 交付与计划：CODE_DELIVERY/PLAN v2（5 步草案）、teacher 扩展链、SFA 确定性、v2 启动脚本 |
-| `transfers/` | 中间补丁工具（fine-FSDP、single-sample loader、pilot 数据构造） |
-| `formal100_run.yaml` / `formal100_train_command.txt` / `final100_verified.json` | formal100 run 的完整 provenance |
-| `venv_packages.txt` | .23 venv 完整包清单（版本对齐用） |
+| 文件                                                                            | 内容                                                                                                                                   |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `speculators_git.diff`                                                          | 12 文件完整 diff（813 行）——框架侧改动的唯一权威来源                                                                                   |
+| `glm_mtp.py` / `rng_state.py`                                                   | 两个新文件原样拷贝                                                                                                                     |
+| `base_commit.txt` / `git_status.txt`                                            | 基线 commit 7ed657f 与工作树状态                                                                                                       |
+| `tools/`                                                                        | 运行现场：extract/convert/export、install 接线、teacher/parity/验收脚本、README_glm53_mtp_23.md、formal100_train_command.txt、run.yaml |
+| `adapter/`                                                                      | 交付与计划：CODE_DELIVERY/PLAN v2（5 步草案）、teacher 扩展链、SFA 确定性、v2 启动脚本                                                 |
+| `transfers/`                                                                    | 中间补丁工具（fine-FSDP、single-sample loader、pilot 数据构造）                                                                        |
+| `formal100_run.yaml` / `formal100_train_command.txt` / `final100_verified.json` | formal100 run 的完整 provenance                                                                                                        |
+| `venv_packages.txt`                                                             | .23 venv 完整包清单（版本对齐用）                                                                                                      |
 
 原 tar 包：`glm53_mtp_patch_study/glm_patch_bundle.tar.gz`。
