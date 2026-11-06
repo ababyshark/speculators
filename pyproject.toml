@@ -161,7 +161,7 @@ warn_redundant_casts = true
 warn_unused_ignores = false
 show_error_codes = true
 namespace_packages = true
-exclude = ["venv", "build", "dist"]
+exclude = ["venv", "build", "dist", "glm-mtp/tests", "glm-mtp/eval_results"]
 
 # Silence "type import errors" as our 3rd-party libs does not have types
 # Check: https://mypy.readthedocs.io/en/latest/config_file.html#import-discovery
