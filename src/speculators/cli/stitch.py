@@ -291,6 +291,18 @@ def stitch(
 
     weights = _unfuse_moe_experts(weights)
     native_weights = {_remap_key(k): v for k, v in weights.items()}
+    # Training-side verifier reference tensors (verifier_norm.weight, ...)
+    # travel with speculators checkpoints for the training loss but are not
+    # part of the native MTP layer; stitch never writes them back.
+    reference_keys = sorted(k for k in native_weights if k.startswith("verifier_"))
+    if reference_keys:
+        console.print(
+            f"  Skipped [yellow]{len(reference_keys)}[/] verifier reference "
+            f"key(s): {reference_keys[:3]}"
+        )
+        native_weights = {
+            k: v for k, v in native_weights.items() if not k.startswith("verifier_")
+        }
     console.print(f"  Remapped [cyan]{len(native_weights)}[/] keys to native format")
 
     if output_path.exists():

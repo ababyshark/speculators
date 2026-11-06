@@ -206,8 +206,21 @@ class DataArgs(_Group):
         "arguments. Default: 'file'.",
         json_schema_extra=_CLI_CHOICES,
     )
+    capture_manifest: str | None = Field(
+        default=None,
+        description="Path to a teacher capture manifest (capture_manifest.json). "
+        "Pins the hidden-state stage so pre-norm captures get the frozen verifier "
+        "norm exactly once and post-norm captures are never re-normed (GLM MTP "
+        "sections 10.2/10.3).",
+    )
     total_seq_len: int = Field(
         default=8192, description="Maximum training sequence length, in tokens."
+    )
+    max_val_batches: int | None = Field(
+        default=None,
+        gt=0,
+        description="Limit validation packed batches for a bounded smoke run; "
+        "omit for full validation.",
     )
     train_data_ratio: float = Field(
         default=0.9,
@@ -430,6 +443,10 @@ class TrainerArgs(_Group):
         "activation memory at the cost of ~30-50 percent slower backward. "
         "Recommended for 32K+ sequence lengths or large max_anchors.",
     )
+    eval_before_train: bool = Field(
+        default=False,
+        description="Evaluate the initial model before the first optimizer step.",
+    )
     max_steps: int | None = Field(
         default=None,
         ge=1,
@@ -623,6 +640,14 @@ class MTPArgs(_Group):
         description="Exponential decay factor for MTP step weights; higher weights "
         "earlier prediction steps more. Only used with MTP.",
     )
+    mtp_train_forward: Literal["fastmtp", "vllm"] = Field(
+        default="fastmtp",
+        description="MTP training forward. 'fastmtp' is the FastMTP-style "
+        "sequence-wide recursion on pre-norm hidden states. 'vllm' matches vLLM's MTP "
+        "proposer: the head sees the verifier's final-norm hidden states, and draft "
+        "step k attends to the context plus only its own draft chain, at position "
+        "anchor + k. Only used with MTP.",
+    )
 
 
 # Group attribute name -> group model. Order defines both the flatten() key order
@@ -654,6 +679,10 @@ _DEFAULT_LOSS_FN: dict[str, str] = {
     "xpress": '{"ce": 0.1, "tv": 0.9}',
 }
 _DEFAULT_BLOCK_SIZE: dict[str, int] = {"dflash": 16, "xpress": 16}
+
+# Default block size of torch flex attention block masks. Kept here rather than
+# imported, so this module does not import torch.
+FLEX_ATTENTION_BLOCK_SIZE = 128
 
 
 class TrainConfig(BaseSettings):
@@ -736,6 +765,11 @@ class TrainConfig(BaseSettings):
         description="Type of speculator model to train "
         "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp).",
     )
+    eval_only: bool = Field(
+        default=False,
+        description="Load the selected checkpoint and evaluate without optimizer steps. "
+        "Write metrics and provenance under save-path/evaluation.",
+    )
     dry_run: bool = Field(
         default=False,
         description="Build the speculator, initialize weights, save a checkpoint to "
@@ -744,6 +778,11 @@ class TrainConfig(BaseSettings):
         "or --from-pretrained.",
     )
     seed: int = Field(default=42, description="Random seed for reproducibility.")
+    deterministic_algorithms: bool = Field(
+        default=False,
+        description="Require deterministic PyTorch algorithms, including accelerator "
+        "backward operations. Unsupported operations raise an error.",
+    )
     deterministic_cuda: bool = Field(
         default=False,
         description="Set cuda to deterministic mode. This may impact performance.",
@@ -840,6 +879,25 @@ class TrainConfig(BaseSettings):
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_eagle3_flex_seq_len(self) -> "TrainConfig":
+        """Eagle3 with flex attention extends its block mask by whole blocks at each
+        TTT step, which matches the KV cache only when ``total_seq_len`` is a multiple
+        of the flex attention block size. Batches are padded to ``total_seq_len``, so
+        checking it here covers every batch."""
+        if (
+            self.speculator_type == "eagle3"
+            and self.draft.draft_attn_impl == "simple_flex_attention"
+            and self.data.total_seq_len % FLEX_ATTENTION_BLOCK_SIZE != 0
+        ):
+            raise ValueError(
+                "--total-seq-len must be a multiple of "
+                f"{FLEX_ATTENTION_BLOCK_SIZE} for eagle3 with "
+                f"--draft-attn-impl=simple_flex_attention, got "
+                f"{self.data.total_seq_len}"
+            )
         return self
 
     def flatten(self) -> dict[str, Any]:

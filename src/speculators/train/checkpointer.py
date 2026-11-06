@@ -20,7 +20,6 @@ from torch.nn.parallel import DistributedDataParallel
 from transformers.modeling_utils import PreTrainedModel
 
 from speculators.train.distributed import get_rank, is_distributed
-from speculators.utils.util import get_current_device
 
 logger = logging.getLogger("speculators")
 
@@ -119,7 +118,7 @@ class BaseCheckpointer:
         model: PreTrainedModel,
         optimizer: OptimizerOrList,
         epoch: int | str,
-        float_dtype: torch.dtype = torch.bfloat16,
+        float_dtype: torch.dtype = torch.float32,
     ):
         raise NotImplementedError
 
@@ -272,10 +271,17 @@ def convert_float_dtype(sd: pytree.PyTree, dtype: torch.dtype) -> pytree.PyTree:
 
 
 def load_safetensors_state_dict(path: Path, device: str) -> dict[str, torch.Tensor]:
+    index_path = Path(str(path) + ".index.json")
+    if index_path.exists():
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        paths = [path.parent / name for name in sorted(set(weight_map.values()))]
+    else:
+        paths = [path]
     full_state_dict = {}
-    with safe_open(path, framework="pt", device=device) as f:
-        for key in f.keys():  # noqa: SIM118
-            full_state_dict[key] = f.get_tensor(key)
+    for shard in paths:
+        with safe_open(shard, framework="pt", device=device) as handle:
+            for key in handle.keys():
+                full_state_dict[key] = handle.get_tensor(key)
     return full_state_dict
 
 
@@ -303,14 +309,13 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     def load_model_state_dict(
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
-        device = get_current_device()
+        device = "cpu"
         full_state_dict = load_safetensors_state_dict(
             self.model_path(self.previous_epoch),
             device,
         )
-        full_state_dict = convert_float_dtype(
-            full_state_dict, float_dtype or model.dtype
-        )
+        if float_dtype is not None:
+            full_state_dict = convert_float_dtype(full_state_dict, float_dtype)
         # Note: `strict=False` because we don't load the verifier weights
         model.load_state_dict(full_state_dict, strict=False)
 
@@ -320,7 +325,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         optimizer: OptimizerOrList,
         float_dtype: torch.dtype | None = None,
     ):
-        device = get_current_device()
+        device = "cpu"
         loaded = torch.load(
             self.optimizer_path(self.previous_epoch),
             weights_only=True,
@@ -328,12 +333,10 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         )
         optimizers = _as_list(optimizer)
         loaded_list = loaded if isinstance(loaded, list) else [loaded]
-        raw_model = (
-            model.module if isinstance(model, DistributedDataParallel) else model
-        )
-        dtype = float_dtype or raw_model.dtype
         for opt, state_dict in zip(optimizers, loaded_list, strict=True):
-            opt.load_state_dict(convert_float_dtype(state_dict, dtype))
+            if float_dtype is not None:
+                state_dict = convert_float_dtype(state_dict, float_dtype)
+            opt.load_state_dict(state_dict)
 
     @_rank0_only
     def save_checkpoint(
@@ -341,7 +344,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         model: PreTrainedModel,
         optimizer: OptimizerOrList,
         epoch: int | str,
-        float_dtype: torch.dtype = torch.bfloat16,
+        float_dtype: torch.dtype = torch.float32,
     ):
         raw_model: PreTrainedModel = (
             model.module if isinstance(model, DistributedDataParallel) else model
@@ -367,9 +370,8 @@ class DistributedCheckpointer(BaseCheckpointer):
         full_state_dict = load_safetensors_state_dict(
             self.model_path(self.previous_epoch), "cpu"
         )
-        full_state_dict = convert_float_dtype(
-            full_state_dict, float_dtype or model.dtype
-        )
+        if float_dtype is not None:
+            full_state_dict = convert_float_dtype(full_state_dict, float_dtype)
 
         # Note: `strict=False` because we don't load the verifier weights
         set_model_state_dict(
@@ -394,9 +396,8 @@ class DistributedCheckpointer(BaseCheckpointer):
             weights_only=True,
             map_location="cpu",
         )
-        full_state_dict = convert_float_dtype(
-            full_state_dict, float_dtype or model.dtype
-        )
+        if float_dtype is not None:
+            full_state_dict = convert_float_dtype(full_state_dict, float_dtype)
 
         set_optimizer_state_dict(
             model,
@@ -418,7 +419,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         model: PreTrainedModel,
         optimizer: OptimizerOrList,
         epoch: int | str,
-        float_dtype: torch.dtype = torch.bfloat16,
+        float_dtype: torch.dtype = torch.float32,
     ):
         model_state_dict = get_model_state_dict(
             model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)

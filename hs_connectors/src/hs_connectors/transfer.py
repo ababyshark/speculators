@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+import math
 import os
 import socket
 import time
@@ -121,10 +122,12 @@ class HiddenStatesBackend(ABC):
 # ---------------------------------------------------------------------------
 
 
-def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
+def _load_hs_file(
+    file_path: Path, lock_timeout: float = 10.0
+) -> dict[str, torch.Tensor] | None:
     lock_path = str(file_path) + ".lock"
     if Path(lock_path).exists():
-        wait_for_lock(lock_path)
+        wait_for_lock(lock_path, timeout=lock_timeout)
 
     if file_path.exists():
         return load_file(file_path)
@@ -135,12 +138,15 @@ def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
 class FileTransfer(HiddenStatesTransfer):
     """File-system based hidden-states transfer (shared filesystem)."""
 
-    def __init__(self, hidden_states_path: Path):
+    def __init__(self, hidden_states_path: Path, *, lock_timeout: float = 10.0):
+        if not math.isfinite(lock_timeout) or lock_timeout <= 0:
+            raise ValueError("lock_timeout must be finite and greater than zero")
         self.hidden_states_path = hidden_states_path
+        self.lock_timeout = lock_timeout
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        return _load_hs_file(path)
+        return _load_hs_file(path, lock_timeout=self.lock_timeout)
 
     def get_generated(
         self, hs_transfer_params: dict[str, Any]
@@ -148,7 +154,7 @@ class FileTransfer(HiddenStatesTransfer):
         handle = hs_transfer_params.get("hidden_states_path") or hs_transfer_params.get(
             "handle"
         )
-        return _load_hs_file(Path(handle))
+        return _load_hs_file(Path(handle), lock_timeout=self.lock_timeout)
 
     def delete(self, handle: str) -> None:
         Path(handle).unlink()
@@ -171,6 +177,14 @@ class FileBackend(HiddenStatesBackend):
             ),
         )
 
+        _add_argument_if_absent(
+            parser,
+            "--hidden-states-lock-timeout",
+            type=float,
+            default=10.0,
+            help="Seconds to wait for asynchronous file writes after the HTTP response.",
+        )
+
     @staticmethod
     def add_launch_args(parser: argparse.ArgumentParser) -> None:
         _add_argument_if_absent(
@@ -191,7 +205,9 @@ class FileBackend(HiddenStatesBackend):
             if args.hidden_states_path
             else Path(data_path) / "hidden_states"
         )
-        return FileTransfer(hs_path)
+        return FileTransfer(
+            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0)
+        )
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -222,8 +238,10 @@ class FP8Transfer(FileTransfer):
         self,
         hidden_states_path: Path,
         dequantize_dtype: torch.dtype = torch.bfloat16,
+        *,
+        lock_timeout: float = 10.0,
     ):
-        super().__init__(hidden_states_path)
+        super().__init__(hidden_states_path, lock_timeout=lock_timeout)
         self.dequantize_dtype = dequantize_dtype
 
     def _dequantize(
@@ -267,16 +285,7 @@ class FP8Backend(HiddenStatesBackend):
 
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
-        _add_argument_if_absent(
-            parser,
-            "--hidden-states-path",
-            type=str,
-            default=None,
-            help=(
-                "The path where cached hidden states files are stored. (Default: "
-                "args.data_path / 'hidden_states')"
-            ),
-        )
+        FileBackend.add_train_args(parser)
 
     @staticmethod
     def add_launch_args(parser: argparse.ArgumentParser) -> None:
@@ -298,7 +307,9 @@ class FP8Backend(HiddenStatesBackend):
             if args.hidden_states_path
             else Path(data_path) / "hidden_states"
         )
-        return FP8Transfer(hs_path)
+        return FP8Transfer(
+            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0)
+        )
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:

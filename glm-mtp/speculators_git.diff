@@ -1,0 +1,813 @@
+diff --git a/hs_connectors/src/hs_connectors/transfer.py b/hs_connectors/src/hs_connectors/transfer.py
+index e9255e5..f4335a6 100644
+--- a/hs_connectors/src/hs_connectors/transfer.py
++++ b/hs_connectors/src/hs_connectors/transfer.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import dataclasses
+ import fcntl
++import math
+ import os
+ import socket
+ import time
+@@ -121,10 +122,12 @@ class HiddenStatesBackend(ABC):
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
++def _load_hs_file(
++    file_path: Path, lock_timeout: float = 10.0
++) -> dict[str, torch.Tensor] | None:
+     lock_path = str(file_path) + ".lock"
+     if Path(lock_path).exists():
+-        wait_for_lock(lock_path)
++        wait_for_lock(lock_path, timeout=lock_timeout)
+ 
+     if file_path.exists():
+         return load_file(file_path)
+@@ -135,12 +138,15 @@ def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
+ class FileTransfer(HiddenStatesTransfer):
+     """File-system based hidden-states transfer (shared filesystem)."""
+ 
+-    def __init__(self, hidden_states_path: Path):
++    def __init__(self, hidden_states_path: Path, *, lock_timeout: float = 10.0):
++        if not math.isfinite(lock_timeout) or lock_timeout <= 0:
++            raise ValueError("lock_timeout must be finite and greater than zero")
+         self.hidden_states_path = hidden_states_path
++        self.lock_timeout = lock_timeout
+ 
+     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
+         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+-        return _load_hs_file(path)
++        return _load_hs_file(path, lock_timeout=self.lock_timeout)
+ 
+     def get_generated(
+         self, hs_transfer_params: dict[str, Any]
+@@ -148,7 +154,7 @@ class FileTransfer(HiddenStatesTransfer):
+         handle = hs_transfer_params.get("hidden_states_path") or hs_transfer_params.get(
+             "handle"
+         )
+-        return _load_hs_file(Path(handle))
++        return _load_hs_file(Path(handle), lock_timeout=self.lock_timeout)
+ 
+     def delete(self, handle: str) -> None:
+         Path(handle).unlink()
+@@ -171,6 +177,14 @@ class FileBackend(HiddenStatesBackend):
+             ),
+         )
+ 
++        _add_argument_if_absent(
++            parser,
++            "--hidden-states-lock-timeout",
++            type=float,
++            default=10.0,
++            help="Seconds to wait for asynchronous file writes after the HTTP response.",
++        )
++
+     @staticmethod
+     def add_launch_args(parser: argparse.ArgumentParser) -> None:
+         _add_argument_if_absent(
+@@ -191,7 +205,9 @@ class FileBackend(HiddenStatesBackend):
+             if args.hidden_states_path
+             else Path(data_path) / "hidden_states"
+         )
+-        return FileTransfer(hs_path)
++        return FileTransfer(
++            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0)
++        )
+ 
+     @staticmethod
+     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
+@@ -222,8 +238,10 @@ class FP8Transfer(FileTransfer):
+         self,
+         hidden_states_path: Path,
+         dequantize_dtype: torch.dtype = torch.bfloat16,
++        *,
++        lock_timeout: float = 10.0,
+     ):
+-        super().__init__(hidden_states_path)
++        super().__init__(hidden_states_path, lock_timeout=lock_timeout)
+         self.dequantize_dtype = dequantize_dtype
+ 
+     def _dequantize(
+@@ -267,16 +285,7 @@ class FP8Backend(HiddenStatesBackend):
+ 
+     @staticmethod
+     def add_train_args(parser: argparse.ArgumentParser) -> None:
+-        _add_argument_if_absent(
+-            parser,
+-            "--hidden-states-path",
+-            type=str,
+-            default=None,
+-            help=(
+-                "The path where cached hidden states files are stored. (Default: "
+-                "args.data_path / 'hidden_states')"
+-            ),
+-        )
++        FileBackend.add_train_args(parser)
+ 
+     @staticmethod
+     def add_launch_args(parser: argparse.ArgumentParser) -> None:
+@@ -298,7 +307,9 @@ class FP8Backend(HiddenStatesBackend):
+             if args.hidden_states_path
+             else Path(data_path) / "hidden_states"
+         )
+-        return FP8Transfer(hs_path)
++        return FP8Transfer(
++            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0)
++        )
+ 
+     @staticmethod
+     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
+diff --git a/src/speculators/models/mtp/config.py b/src/speculators/models/mtp/config.py
+index 7914a9b..69b81f9 100644
+--- a/src/speculators/models/mtp/config.py
++++ b/src/speculators/models/mtp/config.py
+@@ -43,6 +43,10 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
+         ),
+     )
+ 
++    mtp_shared_weights_path: str | None = Field(
++        default=None, description="Native MTP checkpoint containing independent frozen vocab weights"
++    )
++
+     num_nextn_predict_layers: int = Field(
+         default=1,
+         description=(
+diff --git a/src/speculators/models/mtp/core.py b/src/speculators/models/mtp/core.py
+index edc6c04..4db6193 100644
+--- a/src/speculators/models/mtp/core.py
++++ b/src/speculators/models/mtp/core.py
+@@ -131,6 +131,11 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+             flatten_rope_parameters(tc)
+         )
+ 
++        if tc.model_type == "glm_moe_dsa":
++            self._keep_in_fp32_modules_strict = {
++                "input_layernorm", "post_attention_layernorm", "q_a_layernorm",
++                "kv_a_layernorm", "k_norm", "e_score_correction_bias",
++            }
+         self.post_init()
+ 
+     @property
+@@ -147,6 +152,12 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+         """Re-set NaN sentinel before loading — meta-device init may clear
+         it. Deletes verifier_lm_head after loading since MTP does not use it.
+         """
++        if self.config.transformer_layer_config.model_type == "glm_moe_dsa":
++            if not self.config.mtp_shared_weights_path:
++                raise ValueError("GLM requires its independent MTP shared weights")
++            from speculators.models.mtp.glm_mtp import load_native_shared_weights
++            load_native_shared_weights(self)
++            return
+         with torch.no_grad():
+             self.embed_tokens.weight.fill_(torch.nan)
+             self.lm_head.weight.fill_(torch.nan)
+@@ -191,6 +202,20 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+             (lengths, verifier_last_hidden_states)
+         :return: Tuple of (logits_list, loss, metrics)
+         """
++        if self.config.transformer_layer_config.model_type == "glm_moe_dsa":
++            from speculators.models.mtp.glm_mtp import forward_glm_single_step
++            return forward_glm_single_step(
++                self, input_ids, hidden_states, attention_mask=attention_mask,
++                position_ids=position_ids, loss_mask=loss_mask,
++                step_weights=step_weights, **kwargs,
++            )
++        if self.config.transformer_layer_config.model_type == "glm_moe_dsa":
++            from speculators.models.mtp.glm_mtp import forward_glm_mtp
++            return forward_glm_mtp(
++                self, input_ids, hidden_states, attention_mask=attention_mask,
++                position_ids=position_ids, loss_mask=loss_mask,
++                step_weights=step_weights, **kwargs,
++            )
+         input_ids = input_ids.long()
+         device = input_ids.device
+         batch_size, seq_len = input_ids.shape
+diff --git a/src/speculators/models/mtp/data.py b/src/speculators/models/mtp/data.py
+index 2ab7464..e909225 100644
+--- a/src/speculators/models/mtp/data.py
++++ b/src/speculators/models/mtp/data.py
+@@ -10,9 +10,10 @@ def shift_batch_mtp(batch: BatchType) -> BatchType:
+     internally via per-step offset slicing of input_ids.
+     """
+     return {
++        **({"document_ids": batch["document_ids"]} if "document_ids" in batch else {}),
+         "input_ids": batch["input_ids"],
+         "hidden_states": batch["verifier_last_hidden_states"],
+         "loss_mask": batch["loss_mask"],
+-        "lengths": batch["lengths"],
++        **({"lengths": batch["lengths"]} if "lengths" in batch else {}),
+         "position_ids": batch["position_ids"],
+     }
+diff --git a/src/speculators/models/mtp/model_definitions.py b/src/speculators/models/mtp/model_definitions.py
+index cac51b3..45eefe5 100644
+--- a/src/speculators/models/mtp/model_definitions.py
++++ b/src/speculators/models/mtp/model_definitions.py
+@@ -149,7 +149,14 @@ Qwen3MTPLayer = _create_mtp_layer_class(
+     "Qwen3MTPLayer", Qwen3DecoderLayer, Qwen3RMSNorm
+ )
+ 
++from speculators.models.mtp.glm_mtp import (
++    GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding,
++)
++
+ mtp_model_classes: dict[str, base_components.ModelComponents] = {
++    "glm_moe_dsa": base_components.ModelComponents(
++        GlmMTPLayer, GlmMTPLayer, GlmMTPRMSNorm, GlmMTPRotaryEmbedding
++    ),
+     "qwen3": base_components.override_components(
+         "qwen3", first_layer_class=Qwen3MTPLayer
+     ),
+diff --git a/src/speculators/train/checkpointer.py b/src/speculators/train/checkpointer.py
+index 18ed39f..d576b5d 100644
+--- a/src/speculators/train/checkpointer.py
++++ b/src/speculators/train/checkpointer.py
+@@ -20,7 +20,6 @@ from torch.nn.parallel import DistributedDataParallel
+ from transformers.modeling_utils import PreTrainedModel
+ 
+ from speculators.train.distributed import get_rank, is_distributed
+-from speculators.utils.util import get_current_device
+ 
+ logger = logging.getLogger("speculators")
+ 
+@@ -119,7 +118,7 @@ class BaseCheckpointer:
+         model: PreTrainedModel,
+         optimizer: OptimizerOrList,
+         epoch: int | str,
+-        float_dtype: torch.dtype = torch.bfloat16,
++        float_dtype: torch.dtype = torch.float32,
+     ):
+         raise NotImplementedError
+ 
+@@ -272,10 +271,17 @@ def convert_float_dtype(sd: pytree.PyTree, dtype: torch.dtype) -> pytree.PyTree:
+ 
+ 
+ def load_safetensors_state_dict(path: Path, device: str) -> dict[str, torch.Tensor]:
++    index_path = Path(str(path) + ".index.json")
++    if index_path.exists():
++        weight_map = json.loads(index_path.read_text())["weight_map"]
++        paths = [path.parent / name for name in sorted(set(weight_map.values()))]
++    else:
++        paths = [path]
+     full_state_dict = {}
+-    with safe_open(path, framework="pt", device=device) as f:
+-        for key in f.keys():  # noqa: SIM118
+-            full_state_dict[key] = f.get_tensor(key)
++    for shard in paths:
++        with safe_open(shard, framework="pt", device=device) as handle:
++            for key in handle.keys():
++                full_state_dict[key] = handle.get_tensor(key)
+     return full_state_dict
+ 
+ 
+@@ -303,14 +309,13 @@ class SingleGPUCheckpointer(BaseCheckpointer):
+     def load_model_state_dict(
+         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
+     ):
+-        device = get_current_device()
++        device = "cpu"
+         full_state_dict = load_safetensors_state_dict(
+             self.model_path(self.previous_epoch),
+             device,
+         )
+-        full_state_dict = convert_float_dtype(
+-            full_state_dict, float_dtype or model.dtype
+-        )
++        if float_dtype is not None:
++            full_state_dict = convert_float_dtype(full_state_dict, float_dtype)
+         # Note: `strict=False` because we don't load the verifier weights
+         model.load_state_dict(full_state_dict, strict=False)
+ 
+@@ -320,7 +325,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
+         optimizer: OptimizerOrList,
+         float_dtype: torch.dtype | None = None,
+     ):
+-        device = get_current_device()
++        device = "cpu"
+         loaded = torch.load(
+             self.optimizer_path(self.previous_epoch),
+             weights_only=True,
+@@ -328,12 +333,10 @@ class SingleGPUCheckpointer(BaseCheckpointer):
+         )
+         optimizers = _as_list(optimizer)
+         loaded_list = loaded if isinstance(loaded, list) else [loaded]
+-        raw_model = (
+-            model.module if isinstance(model, DistributedDataParallel) else model
+-        )
+-        dtype = float_dtype or raw_model.dtype
+         for opt, state_dict in zip(optimizers, loaded_list, strict=True):
+-            opt.load_state_dict(convert_float_dtype(state_dict, dtype))
++            if float_dtype is not None:
++                state_dict = convert_float_dtype(state_dict, float_dtype)
++            opt.load_state_dict(state_dict)
+ 
+     @_rank0_only
+     def save_checkpoint(
+@@ -341,7 +344,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
+         model: PreTrainedModel,
+         optimizer: OptimizerOrList,
+         epoch: int | str,
+-        float_dtype: torch.dtype = torch.bfloat16,
++        float_dtype: torch.dtype = torch.float32,
+     ):
+         raw_model: PreTrainedModel = (
+             model.module if isinstance(model, DistributedDataParallel) else model
+@@ -367,9 +370,8 @@ class DistributedCheckpointer(BaseCheckpointer):
+         full_state_dict = load_safetensors_state_dict(
+             self.model_path(self.previous_epoch), "cpu"
+         )
+-        full_state_dict = convert_float_dtype(
+-            full_state_dict, float_dtype or model.dtype
+-        )
++        if float_dtype is not None:
++            full_state_dict = convert_float_dtype(full_state_dict, float_dtype)
+ 
+         # Note: `strict=False` because we don't load the verifier weights
+         set_model_state_dict(
+@@ -394,9 +396,8 @@ class DistributedCheckpointer(BaseCheckpointer):
+             weights_only=True,
+             map_location="cpu",
+         )
+-        full_state_dict = convert_float_dtype(
+-            full_state_dict, float_dtype or model.dtype
+-        )
++        if float_dtype is not None:
++            full_state_dict = convert_float_dtype(full_state_dict, float_dtype)
+ 
+         set_optimizer_state_dict(
+             model,
+@@ -418,7 +419,7 @@ class DistributedCheckpointer(BaseCheckpointer):
+         model: PreTrainedModel,
+         optimizer: OptimizerOrList,
+         epoch: int | str,
+-        float_dtype: torch.dtype = torch.bfloat16,
++        float_dtype: torch.dtype = torch.float32,
+     ):
+         model_state_dict = get_model_state_dict(
+             model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+diff --git a/src/speculators/train/cli.py b/src/speculators/train/cli.py
+index 96f70a2..8e63723 100644
+--- a/src/speculators/train/cli.py
++++ b/src/speculators/train/cli.py
+@@ -2,6 +2,7 @@
+ 
+ import argparse
+ import gc
++import json
+ import logging
+ import random
+ import warnings
+@@ -56,13 +57,18 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
+ MROPE_INVERSE_TOLERANCE = 1e-6
+ 
+ 
+-def set_seed(seed: int, deterministic: bool = False):
++def set_seed(
++    seed: int, deterministic: bool = False, deterministic_algorithms: bool = False
++):
+     """Set random seeds for reproducibility."""
+     random.seed(seed)
+     np.random.seed(seed)  # noqa: NPY002
+     torch.manual_seed(seed)
+     torch.cuda.manual_seed_all(seed)
+ 
++    if deterministic_algorithms:
++        torch.use_deterministic_algorithms(True)
++
+     if deterministic:
+         # For deterministic behavior (may impact performance)
+         torch.backends.cudnn.deterministic = True
+@@ -550,12 +556,14 @@ def build_draft_model(
+             return model_class.from_pretrained(
+                 args.from_pretrained,
+                 config=config,
++                dtype=torch.float32,
+                 t2d=t2d,
+                 d2t=d2t,
+                 verifier=args.verifier_name_or_path,
+             )
+         return model_class.from_pretrained(
+             args.from_pretrained,
++            dtype=torch.float32,
+             t2d=t2d,
+             d2t=d2t,
+             verifier=args.verifier_name_or_path,
+@@ -623,7 +631,7 @@ def main(cfg: TrainConfig):  # noqa: C901
+     args = argparse.Namespace(**cfg.flatten())
+ 
+     # Set random seed for reproducibility
+-    set_seed(args.seed, args.deterministic_cuda)
++    set_seed(args.seed, args.deterministic_cuda, args.deterministic_algorithms)
+ 
+     # Setup logging
+     setup_root_logger()
+@@ -653,8 +661,11 @@ def main(cfg: TrainConfig):  # noqa: C901
+     # Write the reproducibility artifacts (run.yaml + train_command.txt) next to
+     # the checkpoints at rank 0 only, so every checkpoint carries the resolved
+     # config that produced it.
++    provenance_path = (
++        Path(args.save_path) / "evaluation" if args.eval_only else Path(args.save_path)
++    )
+     if get_rank() == 0:
+-        cfg.save(args.save_path)
++        cfg.save(provenance_path)
+ 
+     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
+ 
+@@ -757,6 +768,7 @@ def main(cfg: TrainConfig):  # noqa: C901
+         max_transfer_workers=args.max_transfer_workers,
+         preprocess=preprocess,
+         train_data_ratio=args.train_data_ratio,
++        max_val_batches=args.max_val_batches,
+         seed=args.seed,
+     )
+ 
+@@ -790,11 +802,19 @@ def main(cfg: TrainConfig):  # noqa: C901
+         fsdp_shard=args.fsdp_shard,
+         gradient_checkpointing=args.gradient_checkpointing,
+         max_steps=args.max_steps,
++        eval_before_train=args.eval_before_train,
+     )
+     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
+ 
+-    # Run training
+-    trainer.run_training()
++    # Evaluation shares checkpoint loading and the online data path with training.
++    if args.eval_only:
++        metrics = trainer.val_epoch(trainer.current_epoch)
++        if get_rank() == 0:
++            (provenance_path / "metrics.json").write_text(json.dumps(metrics, indent=2))
++        if trainer.checkpointer.previous_epoch != -1:
++            trainer.maybe_update_best(trainer.checkpointer.previous_epoch, metrics)
++    else:
++        trainer.run_training()
+ 
+     # Cleanup
+     del trainer, draft_model
+diff --git a/src/speculators/train/config/schema.py b/src/speculators/train/config/schema.py
+index db09631..7253c2c 100644
+--- a/src/speculators/train/config/schema.py
++++ b/src/speculators/train/config/schema.py
+@@ -209,6 +209,12 @@ class DataArgs(_Group):
+     total_seq_len: int = Field(
+         default=8192, description="Maximum training sequence length, in tokens."
+     )
++    max_val_batches: int | None = Field(
++        default=None,
++        gt=0,
++        description="Limit validation packed batches for a bounded smoke run; "
++        "omit for full validation.",
++    )
+     train_data_ratio: float = Field(
+         default=0.9,
+         description="Fraction of the dataset used for training; the remainder is held "
+@@ -430,6 +436,10 @@ class TrainerArgs(_Group):
+         "activation memory at the cost of ~30-50 percent slower backward. "
+         "Recommended for 32K+ sequence lengths or large max_anchors.",
+     )
++    eval_before_train: bool = Field(
++        default=False,
++        description="Evaluate the initial model before the first optimizer step.",
++    )
+     max_steps: int | None = Field(
+         default=None,
+         ge=1,
+@@ -736,6 +746,11 @@ class TrainConfig(BaseSettings):
+         description="Type of speculator model to train "
+         "(eagle3, dflash, dflash2, dspark, xpress, peagle, mtp).",
+     )
++    eval_only: bool = Field(
++        default=False,
++        description="Load the selected checkpoint and evaluate without optimizer steps. "
++        "Write metrics and provenance under save-path/evaluation.",
++    )
+     dry_run: bool = Field(
+         default=False,
+         description="Build the speculator, initialize weights, save a checkpoint to "
+@@ -744,6 +759,11 @@ class TrainConfig(BaseSettings):
+         "or --from-pretrained.",
+     )
+     seed: int = Field(default=42, description="Random seed for reproducibility.")
++    deterministic_algorithms: bool = Field(
++        default=False,
++        description="Require deterministic PyTorch algorithms, including accelerator "
++        "backward operations. Unsupported operations raise an error.",
++    )
+     deterministic_cuda: bool = Field(
+         default=False,
+         description="Set cuda to deterministic mode. This may impact performance.",
+diff --git a/src/speculators/train/dataloader.py b/src/speculators/train/dataloader.py
+index d7bbec8..34a1051 100644
+--- a/src/speculators/train/dataloader.py
++++ b/src/speculators/train/dataloader.py
+@@ -69,17 +69,30 @@ def _setup_dataloader(
+     max_batches: int | None = None,
+     seed: int = 0,
+ ) -> DataLoader:
+-    batch_sampler = MultipackDistributedBatchSamplerV2(
+-        batch_max_length=total_seq_len,
+-        lengths=dataset.approx_lengths,
+-        num_replicas=get_dp_size(),
+-        rank=get_dp_rank(),
+-        seed=seed,
+-        max_batches=max_batches,
+-    )
++    if os.environ.get("SPECULATORS_MTP_NO_PACK") == "1":
++        class _SingleSampleSampler:
++            def __iter__(self):
++                indices = list(range(get_dp_rank(), len(dataset), get_dp_size()))
++                if max_batches is not None:
++                    indices = indices[:max_batches]
++                return iter(([i] for i in indices))
++            def __len__(self):
++                n = max(0, (len(dataset) - get_dp_rank() + get_dp_size() - 1) // get_dp_size())
++                return min(n, max_batches) if max_batches is not None else n
++        batch_sampler = _SingleSampleSampler()
++    else:
++        batch_sampler = MultipackDistributedBatchSamplerV2(
++            batch_max_length=total_seq_len,
++            lengths=dataset.approx_lengths,
++            num_replicas=get_dp_size(),
++            rank=get_dp_rank(),
++            seed=seed,
++            max_batches=max_batches,
++        )
+     use_workers = num_workers > 0
+     return DataLoader(
+         dataset,
++        generator=torch.Generator().manual_seed(seed),
+         batch_sampler=batch_sampler,
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor if use_workers else None,
+@@ -113,6 +126,7 @@ def create_train_val_loaders(
+     max_train_batches: int | None = None,
+     seed: int = 0,
+     max_transfer_workers: int = 1,
++    max_val_batches: int | None = None,
+ ) -> tuple[DataLoader, DataLoader]:
+     """Create training and validation DataLoaders.
+ 
+@@ -195,6 +209,7 @@ def create_train_val_loaders(
+         total_seq_len,
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor,
++        max_batches=max_val_batches,
+     )
+ 
+     return train_loader, val_loader
+diff --git a/src/speculators/train/distributed.py b/src/speculators/train/distributed.py
+index 7291bef..b74da0d 100644
+--- a/src/speculators/train/distributed.py
++++ b/src/speculators/train/distributed.py
+@@ -203,12 +203,27 @@ def apply_fully_sharded(
+     Model should be validated with SpeculatorModel.verify_training_compatible()
+     before calling this function.
+     """
++    # Keep FP32 gradient reduction by default. Large GLM-MTP pilots can
++    # opt into bf16 reduction via an explicit environment override.
++    reduce_name = os.environ.get("SPECULATORS_FSDP_REDUCE_DTYPE", "float32")
++    if reduce_name not in {"float32", "bfloat16"}:
++        raise ValueError(
++            "SPECULATORS_FSDP_REDUCE_DTYPE must be float32 or bfloat16"
++        )
++    reduce_dtype = torch.bfloat16 if reduce_name == "bfloat16" else torch.float32
+     mp_policy = MixedPrecisionPolicy(
+         param_dtype=param_dtype,
+-        reduce_dtype=torch.float32,
++        reduce_dtype=reduce_dtype,
+     )
+ 
++    # GLM native MTP has one very large sparse-MoE layer. Shard attention,
++    # router, shared expert and each routed expert before the enclosing layer.
++    model_type = getattr(getattr(model.config, "transformer_layer_config", None), "model_type", None)
+     for layer in model.layers:  # type: ignore[union-attr]
++        if model_type == "glm_moe_dsa":
++            children = [layer.self_attn, layer.mlp.gate, layer.mlp.shared_experts, *layer.mlp.experts]
++            for child in children:
++                fully_shard(child, mp_policy=mp_policy)
+         fully_shard(layer, mp_policy=mp_policy)
+ 
+     fully_shard(model, mp_policy=mp_policy)
+diff --git a/src/speculators/train/trainer.py b/src/speculators/train/trainer.py
+index 2224444..2491429 100644
+--- a/src/speculators/train/trainer.py
++++ b/src/speculators/train/trainer.py
+@@ -36,6 +36,11 @@ from speculators.train.distributed import (
+ from speculators.train.graceful_shutdown import with_graceful_shutdown
+ from speculators.train.optimizers import build_optimizers
+ from speculators.train.recovery import BatchRecoveryCoordinator
++from speculators.train.rng_state import (
++    capture_rng_state,
++    restore_rng_state,
++    validation_rng,
++)
+ from speculators.train.utils import normalize_counted_metrics
+ 
+ root_logger = logging.getLogger("speculators")
+@@ -192,6 +197,7 @@ class TrainerConfig(NamedTuple):
+     fsdp_shard: bool = False
+     gradient_checkpointing: bool = False
+     max_steps: int | None = None
++    eval_before_train: bool = False
+ 
+ 
+ def _resolve_scheduler_steps(
+@@ -245,6 +251,15 @@ class Trainer:
+         val_loader: DataLoader | None = None,
+     ):
+         self.model = model
++        # Preserve FP32 masters while keeping frozen verifier tensors compact.
++        for parameter in model.parameters():
++            if parameter.is_floating_point():
++                dtype = (
++                    torch.float32
++                    if parameter.requires_grad
++                    else config.hidden_states_dtype
++                )
++                parameter.data = parameter.data.to(dtype)
+         self.config = config
+         self.local_rank = get_local_rank()
+         self.rank = get_rank()
+@@ -264,6 +279,17 @@ class Trainer:
+         self.setup_trainer()
+         self.setup_model()
+         self.setup_optimizer()
++        if self.resume_from_checkpoint and self.checkpointer.prev_path is not None:
++            path = self.checkpointer.prev_path / f"rng_state_rank{self.rank}.pt"
++            if path.exists():
++                restore_rng_state(
++                    torch.load(path, map_location="cpu", weights_only=True)
++                )
++                root_logger.info("Restored RNG state from %s", path)
++            else:
++                root_logger.warning(
++                    "Checkpoint has no RNG state; continuation is not exact"
++                )
+ 
+     def _training_state_path(self, epoch: int) -> Path:
+         return self.checkpointer.path / str(epoch) / "training_state.json"
+@@ -533,6 +559,7 @@ class Trainer:
+             if self.config.checkpoint_freq < 1
+             else None
+         )
++        local_step = skip_steps
+         t_before_fetch = time.perf_counter()
+         timer = _StepTimer()
+         recovery = BatchRecoveryCoordinator("training")
+@@ -576,7 +603,9 @@ class Trainer:
+             self._optimizers_zero_grad()
+             loss.backward()
+             timer.mark("pre_clip")
+-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
++            torch.nn.utils.clip_grad_norm_(
++                self.model.parameters(), 1.0, error_if_nonfinite=True
++            )
+ 
+             metrics["error_records_sum"] = torch.full(
+                 (), batch["error_records"], dtype=torch.float32, device=loss.device
+@@ -642,6 +671,8 @@ class Trainer:
+             ):
+                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+ 
++        return local_step if local_step < num_steps else 0
++
+     def _maybe_val_sync(self, batch_index: int) -> None:
+         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
+             return
+@@ -650,11 +681,15 @@ class Trainer:
+ 
+     @torch.no_grad()
+     def val_epoch(self, epoch: int) -> dict[str, float] | None:
++        with validation_rng(seed=0):
++            return self._val_epoch(epoch)
++
++    def _val_epoch(self, epoch: int) -> dict[str, float] | None:
+         if self.val_loader is None:
+             return None
+         self.model.eval()
+         if hasattr(self.val_loader.batch_sampler, "set_epoch"):
+-            self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
++            self.val_loader.batch_sampler.set_epoch(0)  # type: ignore[union-attr]
+         val_loader = self.val_loader
+         if self.rank == 0:
+             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+@@ -719,6 +754,7 @@ class Trainer:
+         self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
+         if self.schedulers:
+             self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
++        self._save_rng_state(epoch)
+         if isinstance(epoch, int):
+             self._save_training_state(epoch, local_step)
+             # Create a human-readable symlink for checkpoint readability.
+@@ -735,14 +771,47 @@ class Trainer:
+                 link_name.symlink_to(target)
+         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
+ 
++    def _save_rng_state(self, epoch: int | str) -> None:
++        # DDP checkpoint I/O is rank-zero-only. Wait for its directory to exist
++        # before every rank saves its independent RNG state.
++        if self.is_distributed:
++            dist.barrier()
++        torch.save(
++            capture_rng_state(),
++            self.checkpointer.path / str(epoch) / f"rng_state_rank{self.rank}.pt",
++        )
++
+     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
+         if val_metrics is None or "loss_epoch" not in val_metrics:
+             return
++        if not self.config.save_best:
++            if not (self.checkpointer.path / str(epoch)).is_dir():
++                return
++            # A resumed mid-epoch save replaces this epoch's weights. Always
++            # replace its metrics too, even when validation did not improve.
++            self.checkpointer.save_val_metrics(epoch, val_metrics)
++            if self.is_distributed:
++                dist.barrier()
++            candidates = []
++            for directory in self.checkpointer.path.iterdir():
++                metrics_path = directory / "val_metrics.json"
++                if directory.is_symlink() or not directory.name.isdigit():
++                    continue
++                if metrics_path.exists():
++                    metrics = json.loads(metrics_path.read_text())
++                    candidates.append((metrics["loss_epoch"], int(directory.name)))
++            self.best_val_loss, best_epoch = min(candidates)
++            self.checkpointer.update_best_symlink(best_epoch)
++            return
+         if val_metrics["loss_epoch"] >= self.best_val_loss:
+             return
+ 
+         if self.config.save_best:
+             self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
++            self._save_training_state(
++                epoch, getattr(self, "_checkpoint_local_step", 0)
++            )
++            self._save_rng_state(epoch)
+             if self.schedulers:
+                 self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+         elif self.config.checkpoint_freq >= 1 and not (
+@@ -762,15 +831,28 @@ class Trainer:
+     @with_graceful_shutdown()
+     def run_training(self):
+         n_epochs = self.config.num_epochs
++        if self.config.eval_before_train and self.global_step == 0:
++            baseline = self.val_epoch(-1)
++            if self.rank == 0:
++                (self.checkpointer.path / "baseline_metrics.json").write_text(
++                    json.dumps(baseline, indent=2)
++                )
+         for epoch in range(self.current_epoch, n_epochs):
++            if (
++                self.config.max_steps is not None
++                and self.global_step >= self.config.max_steps
++            ):
++                break
+             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
+-            self.train_epoch(epoch)
++            self._checkpoint_local_step = self.train_epoch(epoch) or 0
+             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
+ 
+             if self.is_distributed:
+                 dist.barrier()
+ 
+-            self.maybe_save_checkpoint(epoch)
++            self.maybe_save_checkpoint(
++                epoch, local_step=self._checkpoint_local_step
++            )
+ 
+             if self.is_distributed:
+                 dist.barrier()
+diff --git a/tests/unit/train/test_mid_epoch_resume.py b/tests/unit/train/test_mid_epoch_resume.py
+index 14b7c3b..c08602b 100644
+--- a/tests/unit/train/test_mid_epoch_resume.py
++++ b/tests/unit/train/test_mid_epoch_resume.py
+@@ -275,7 +275,9 @@ def test_distributed_mid_epoch_checkpoint_rank_gate(
+     trained_steps: list[tuple[int, int, int]],
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+-    """Rank-0 writes state/symlink while nonzero ranks skip side effects."""
++    """Only rank zero writes shared metadata; every rank saves its RNG."""
++    barriers = []
++    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
+     with tempfile.TemporaryDirectory() as tmpdir:
+         num_steps = len(_make_loader())
+         step_interval = max(1, round(num_steps * 0.3))
+@@ -300,6 +302,7 @@ def test_distributed_mid_epoch_checkpoint_rank_gate(
+             trained_steps=rank1_steps,
+         )
+         rank1.is_distributed = True
++        rank1.rank = 1
+         monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+         rank1.maybe_save_checkpoint(0, local_step=step_interval)
+ 
+@@ -307,6 +310,8 @@ def test_distributed_mid_epoch_checkpoint_rank_gate(
+         link_rank1 = Path(tmpdir) / f"epoch0_step{step_interval}"
+         assert not state_rank1.exists()
+         assert not link_rank1.exists()
++        assert (Path(tmpdir) / "0" / "rng_state_rank1.pt").exists()
++    assert len(barriers) == 2
+ 
+ 
+ class _CountingDataset(Dataset):

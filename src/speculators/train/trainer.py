@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 import warnings
 from collections.abc import Callable
@@ -36,6 +37,11 @@ from speculators.train.distributed import (
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.recovery import BatchRecoveryCoordinator
+from speculators.train.rng_state import (
+    capture_rng_state,
+    restore_rng_state,
+    validation_rng,
+)
 from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
@@ -135,7 +141,7 @@ class _StepTimer:
             "fetch_frac": fetch_ms / step_ms if step_ms > 0 else 0.0,
             "queue_ms": (m["queue"] - m["start"]) * 1000,
             "h2d_ms": (m["fetch"] - m["pre_h2d"]) * 1000,
-            "clip_ms": (m["bwd"] - m["pre_clip"]) * 1000,
+            "clip_ms": (m["bwd"] - m.get("pre_clip", m["bwd"])) * 1000,
         }
         if self._memory:
             result["memory_mb"] = dict(self._memory)
@@ -150,6 +156,11 @@ _RECOVERY_SYNC_INTERVAL = 50
 
 # Bound rank skew before the validation metrics reduction.
 _VAL_SYNC_INTERVAL = 50
+
+# Training state is fp32 whatever the frozen weights are stored in. The default
+# is `model.dtype`, which just takes the first floating parameter it finds, so
+# precasting a frozen head could silently make the whole load bf16.
+_CHECKPOINT_FLOAT_DTYPE = torch.float32
 
 
 def _should_sync_recovery(
@@ -192,6 +203,7 @@ class TrainerConfig(NamedTuple):
     fsdp_shard: bool = False
     gradient_checkpointing: bool = False
     max_steps: int | None = None
+    eval_before_train: bool = False
 
 
 def _resolve_scheduler_steps(
@@ -245,6 +257,15 @@ class Trainer:
         val_loader: DataLoader | None = None,
     ):
         self.model = model
+        # Preserve FP32 masters while keeping frozen verifier tensors compact.
+        for parameter in model.parameters():
+            if parameter.is_floating_point():
+                dtype = (
+                    torch.float32
+                    if parameter.requires_grad
+                    else config.hidden_states_dtype
+                )
+                parameter.data = parameter.data.to(dtype)
         self.config = config
         self.local_rank = get_local_rank()
         self.rank = get_rank()
@@ -264,6 +285,17 @@ class Trainer:
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
+        if self.resume_from_checkpoint and self.checkpointer.prev_path is not None:
+            path = self.checkpointer.prev_path / f"rng_state_rank{self.rank}.pt"
+            if path.exists():
+                restore_rng_state(
+                    torch.load(path, map_location="cpu", weights_only=True)
+                )
+                root_logger.info("Restored RNG state from %s", path)
+            else:
+                root_logger.warning(
+                    "Checkpoint has no RNG state; continuation is not exact"
+                )
 
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
@@ -350,9 +382,42 @@ class Trainer:
                     f"Restored best_val_loss={self.best_val_loss:.6f} from checkpoint"
                 )
 
+    def _precast_frozen_linear_weights(self):
+        """Store frozen linear weights in the autocast dtype.
+
+        Trainable weights keep their fp32 master copy.
+        """
+        if self.is_distributed and self.config.fsdp_shard:
+            # FSDP2 all-gathers in the autocast dtype, and one parameter
+            # group must share a single original dtype.
+            return
+
+        dtype = self.config.hidden_states_dtype
+        converted = 0
+        for module in self.model.modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            for name in ("weight", "bias"):
+                param = getattr(module, name, None)
+                if (
+                    param is None
+                    or param.requires_grad
+                    or not param.is_floating_point()
+                    or param.dtype == dtype
+                ):
+                    continue
+                param.data = param.data.to(dtype)
+                converted += param.numel()
+        if converted:
+            root_logger.info(f"Cast {converted:,} frozen linear parameters to {dtype}")
+
     def setup_model(self):
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
+
+        # Must run before wrapping or checkpoint load; both read the dtype
+        # the parameters already have.
+        self._precast_frozen_linear_weights()
 
         # Enable gradient checkpointing BEFORE FSDP/DDP wrapping to save
         # activation memory at the cost of recomputation during backward.
@@ -375,7 +440,9 @@ class Trainer:
         if not self.is_distributed:
             self.model.to(self.local_rank)  # type: ignore[arg-type]
             if load_checkpoint:
-                self.checkpointer.load_model_state_dict(self.model)
+                self.checkpointer.load_model_state_dict(
+                    self.model, float_dtype=_CHECKPOINT_FLOAT_DTYPE
+                )
             return
 
         if self.config.fsdp_shard:
@@ -383,7 +450,31 @@ class Trainer:
         else:
             self._setup_model_ddp(load_checkpoint)
 
+    def _maybe_freeze_experts(self) -> None:
+        """Env-gated MoE expert freeze (``SPECULATORS_MTP_FREEZE_EXPERTS=1``).
+
+        A 256-expert MTP draft layer holds ~9.6B expert params as single
+        fused 12 GiB (bf16) parameters.  FSDP2 cannot shard a single fused
+        parameter finer, so backward holds a ~20 GiB unsharded grad buffer
+        for the layer unit on top of the ~20 GiB all-gather — beyond a 64
+        GiB accelerator.  Freezing the experts removes the grad buffer while
+        keeping their forward contribution; gate/head/attention/norms stay
+        trainable.  Intended for pipeline smokes; full-parameter runs need
+        per-expert parameter splitting or larger accelerators.
+        """
+        if os.environ.get("SPECULATORS_MTP_FREEZE_EXPERTS", "0") != "1":
+            return
+        frozen = 0
+        for name, param in self.model.named_parameters():
+            if ".mlp.experts" in name or ".mlp.shared_expert" in name:
+                param.requires_grad_(False)
+                frozen += 1
+        root_logger.info(
+            "SPECULATORS_MTP_FREEZE_EXPERTS=1: froze %d expert parameters", frozen
+        )
+
     def _setup_model_fsdp(self, load_checkpoint: bool):
+        self._maybe_freeze_experts()
         # Capture full state dict on rank 0 before FSDP sharding
         full_state_dict = {}
         if not load_checkpoint and dist.get_rank() == 0:
@@ -392,7 +483,9 @@ class Trainer:
         apply_fully_sharded(self.model, param_dtype=self.config.hidden_states_dtype)
 
         if load_checkpoint:
-            self.checkpointer.load_model_state_dict(self.model)
+            self.checkpointer.load_model_state_dict(
+                self.model, float_dtype=_CHECKPOINT_FLOAT_DTYPE
+            )
         else:
             # Broadcast full state dict from rank 0 to all ranks
             set_model_state_dict(
@@ -407,12 +500,27 @@ class Trainer:
             del full_state_dict
             dist.barrier()
 
+        # Env-gated: restore fp32 master weights after sharding.  Pairs with
+        # SPECULATORS_INIT_DTYPE=bfloat16 on the construction side — the
+        # pre-shard full fp32 materialization would exceed a single
+        # accelerator for large MoE drafts, so the model is built in bf16,
+        # sharded, and only then upcast (per-rank cost: one fp32 shard).
+        # Trainable parameters only: frozen tensors keep the compact
+        # hidden_states_dtype from _precast_frozen_linear_weights.
+        if os.environ.get("SPECULATORS_UPCAST_FP32", "0") == "1":
+            for param in self.model.parameters():
+                if param.requires_grad:
+                    param.data = param.data.to(torch.float32)
+
     def _setup_model_ddp(self, load_checkpoint: bool):
+        self._maybe_freeze_experts()
         self.model.to(self.local_rank)  # type: ignore[arg-type]
 
         if load_checkpoint:
             if dist.get_rank() == 0:
-                self.checkpointer.load_model_state_dict(self.model)
+                self.checkpointer.load_model_state_dict(
+                    self.model, float_dtype=_CHECKPOINT_FLOAT_DTYPE
+                )
         else:
             # Fresh init: broadcast rank 0's random initialization to all ranks
             for param in self.model.parameters():
@@ -428,7 +536,9 @@ class Trainer:
         self.optimizers = build_optimizers(self.model, self.config)
         last_epoch = -1
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
-            self.checkpointer.load_optimizer_state_dict(self.model, self.optimizers)
+            self.checkpointer.load_optimizer_state_dict(
+                self.model, self.optimizers, float_dtype=_CHECKPOINT_FLOAT_DTYPE
+            )
             last_epoch = self.checkpointer.previous_epoch
 
         # Setup scheduler(s) — one per optimizer so each optimizer's base LR (e.g.
@@ -533,6 +643,7 @@ class Trainer:
             if self.config.checkpoint_freq < 1
             else None
         )
+        local_step = skip_steps
         t_before_fetch = time.perf_counter()
         timer = _StepTimer()
         recovery = BatchRecoveryCoordinator("training")
@@ -576,7 +687,9 @@ class Trainer:
             self._optimizers_zero_grad()
             loss.backward()
             timer.mark("pre_clip")
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 1.0, error_if_nonfinite=True
+            )
 
             metrics["error_records_sum"] = torch.full(
                 (), batch["error_records"], dtype=torch.float32, device=loss.device
@@ -642,6 +755,8 @@ class Trainer:
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
 
+        return local_step if local_step < num_steps else 0
+
     def _maybe_val_sync(self, batch_index: int) -> None:
         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
             return
@@ -650,11 +765,15 @@ class Trainer:
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
+        with validation_rng(seed=0):
+            return self._val_epoch(epoch)
+
+    def _val_epoch(self, epoch: int) -> dict[str, float] | None:
         if self.val_loader is None:
             return None
         self.model.eval()
         if hasattr(self.val_loader.batch_sampler, "set_epoch"):
-            self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
+            self.val_loader.batch_sampler.set_epoch(0)  # type: ignore[union-attr]
         val_loader = self.val_loader
         if self.rank == 0:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
@@ -719,6 +838,7 @@ class Trainer:
         self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
         if self.schedulers:
             self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+        self._save_rng_state(epoch)
         if isinstance(epoch, int):
             self._save_training_state(epoch, local_step)
             # Create a human-readable symlink for checkpoint readability.
@@ -735,14 +855,45 @@ class Trainer:
                 link_name.symlink_to(target)
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
 
+    def _save_rng_state(self, epoch: int | str) -> None:
+        # DDP checkpoint I/O is rank-zero-only. Wait for its directory to exist
+        # before every rank saves its independent RNG state.
+        if self.is_distributed:
+            dist.barrier()
+        torch.save(
+            capture_rng_state(),
+            self.checkpointer.path / str(epoch) / f"rng_state_rank{self.rank}.pt",
+        )
+
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:
+            return
+        if not self.config.save_best:
+            if not (self.checkpointer.path / str(epoch)).is_dir():
+                return
+            # A resumed mid-epoch save replaces this epoch's weights. Always
+            # replace its metrics too, even when validation did not improve.
+            self.checkpointer.save_val_metrics(epoch, val_metrics)
+            if self.is_distributed:
+                dist.barrier()
+            candidates = []
+            for directory in self.checkpointer.path.iterdir():
+                metrics_path = directory / "val_metrics.json"
+                if directory.is_symlink() or not directory.name.isdigit():
+                    continue
+                if metrics_path.exists():
+                    metrics = json.loads(metrics_path.read_text())
+                    candidates.append((metrics["loss_epoch"], int(directory.name)))
+            self.best_val_loss, best_epoch = min(candidates)
+            self.checkpointer.update_best_symlink(best_epoch)
             return
         if val_metrics["loss_epoch"] >= self.best_val_loss:
             return
 
         if self.config.save_best:
             self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
+            self._save_training_state(epoch, getattr(self, "_checkpoint_local_step", 0))
+            self._save_rng_state(epoch)
             if self.schedulers:
                 self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
         elif self.config.checkpoint_freq >= 1 and not (
@@ -762,15 +913,26 @@ class Trainer:
     @with_graceful_shutdown()
     def run_training(self):
         n_epochs = self.config.num_epochs
+        if self.config.eval_before_train and self.global_step == 0:
+            baseline = self.val_epoch(-1)
+            if self.rank == 0:
+                (self.checkpointer.path / "baseline_metrics.json").write_text(
+                    json.dumps(baseline, indent=2)
+                )
         for epoch in range(self.current_epoch, n_epochs):
+            if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                break
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
-            self.train_epoch(epoch)
+            self._checkpoint_local_step = self.train_epoch(epoch) or 0
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
 
             if self.is_distributed:
                 dist.barrier()
 
-            self.maybe_save_checkpoint(epoch)
+            self.maybe_save_checkpoint(epoch, local_step=self._checkpoint_local_step)
 
             if self.is_distributed:
                 dist.barrier()

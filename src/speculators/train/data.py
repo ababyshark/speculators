@@ -108,12 +108,19 @@ class SpeculatorsDataset(Dataset):
         hidden_states_dtype=torch.bfloat16,
         num_target_layers: int = 3,
         preprocess: Callable[[BatchType], BatchType] | None = None,
+        hidden_state_stage: str | None = None,
     ):
+        if hidden_state_stage not in (None, "pre_norm", "post_norm"):
+            raise ValueError(
+                "hidden_state_stage must be 'pre_norm', 'post_norm' or None, "
+                f"got {hidden_state_stage!r}."
+            )
         self.max_len = max_len
         self.hidden_size = hidden_size
         self.num_target_layers = num_target_layers
         self.preprocess = preprocess
         self.hidden_states_dtype = hidden_states_dtype
+        self.hidden_state_stage = hidden_state_stage
         self.records = records
         self.hidden_states = hidden_states
         self.approx_lengths = records.approx_lengths
@@ -223,6 +230,8 @@ class SpeculatorsDataset(Dataset):
             locally_empty = True
 
         batch["error_records"] = len(unavailable)
+        if self.hidden_state_stage is not None:
+            batch["hidden_state_stage"] = self.hidden_state_stage
         metadata = RecoveryMetadata.from_unavailable(
             unavailable,
             locally_empty=locally_empty,
@@ -247,6 +256,18 @@ def _pad_samples(batch: list[BatchType], max_len: int, dtype: torch.dtype) -> Ba
 
         # One copy per sample: preallocated buffer, hidden states cast during write.
         first = batch[0][key]
+        if not isinstance(first, torch.Tensor):
+            # Run-level metadata (e.g. a capture stage) rides along unchanged;
+            # every sample must agree on its value.
+            if any(sample[key] != first for sample in batch):
+                raise ValueError(
+                    f"Non-tensor batch key {key!r} differs across samples: "
+                    f"{first!r} vs "
+                    f"{[sample[key] for sample in batch if sample[key] != first]!r}"
+                )
+            collated_data[key] = first
+            continue
+
         buffer_dtype = dtype if "hidden_states" in key else first.dtype
         out = torch.zeros(
             (max_len, *first.shape[1:]), dtype=buffer_dtype, device=first.device

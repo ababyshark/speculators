@@ -285,33 +285,29 @@ def test_primary_identifier_falls_back_to_content_hash():
 
 
 def test_load_seen_missing_file_returns_empty(tmp_path):
-    """A missing output file yields empty seen and truncated sets."""
-    assert load_seen(str(tmp_path / "nope.jsonl")) == (set(), set())
+    assert load_seen(str(tmp_path / "nope.jsonl")) == set()
 
 
 def test_load_seen_reads_id_and_skips_malformed_lines(tmp_path):
-    """Top-level ids are collected; malformed lines are skipped."""
     out = tmp_path / "out.jsonl"
     out.write_text(
         "not json\n" + json.dumps({"id": "P"}) + "\n",
         encoding="utf-8",
     )
-    assert load_seen(str(out)) == ({"P"}, set())
+    assert load_seen(str(out)) == {"P"}
 
 
 def test_load_seen_ignores_rows_without_id(tmp_path):
-    """Rows without any id contribute no resume key."""
     # A record without a top-level id contributes no resume key.
     out = tmp_path / "out.jsonl"
     out.write_text(
         json.dumps({"conversations": [], "metadata": {"idx": 3}}) + "\n",
         encoding="utf-8",
     )
-    assert load_seen(str(out)) == (set(), set())
+    assert load_seen(str(out)) == set()
 
 
 def test_resume_roundtrip_hash_only_row(tmp_path):
-    """A stored content-hash id is recovered by load_seen on resume."""
     # A row with no explicit id resolves to a content hash; the written output
     # stores that hash as the top-level id, and load_seen must recover it so a
     # re-run skips the row. This is the exact case the old resume missed.
@@ -331,7 +327,7 @@ def test_resume_roundtrip_hash_only_row(tmp_path):
         encoding="utf-8",
     )
 
-    assert primary_id in load_seen(str(out))[0]
+    assert primary_id in load_seen(str(out))
 
 
 # ---------------------------------------------------------------------------
@@ -473,15 +469,9 @@ def _ok(prompt_token_ids, completion_token_ids, text):
 
 
 def _run_worker(responses, tmp_path, stem):
-    """Run _worker on a two-turn conversation with canned responses.
-
-    Returns ``(stats, out_path, err_path)``; the output and error files
-    are created under ``tmp_path`` as ``<stem>.jsonl`` / ``<stem>.errors.jsonl``.
-    """
     out_path, err_path = tmp_path / f"{stem}.jsonl", tmp_path / f"{stem}.errors.jsonl"
 
     async def scenario(out_fh, err_fh):
-        """Enqueue the two-turn item, then the stop sentinel, and drain."""
         queue: asyncio.Queue = asyncio.Queue()
         await queue.put(_TWO_TURN_ITEM)
         await queue.put(None)
@@ -492,11 +482,6 @@ def _run_worker(responses, tmp_path, stem):
             "requests": 0,
             "completion_tokens": 0,
             "total_request_s": 0.0,
-            "resumed_skipped": 0,
-            "seen_ids": set(),
-            "ok_ids": set(),
-            "trunc_ids": set(),
-            "error_ids": set(),
             "start_time": time.perf_counter(),
         }
         await _worker(
@@ -524,7 +509,6 @@ def _run_worker(responses, tmp_path, stem):
 
 
 def test_worker_row_identity_and_all_or_nothing_writes(tmp_path):
-    """Rows key on primary_id; a failed turn discards the conversation."""
     # Two assistant turns -> two rows. `primary_id` is the queue item's stable id
     # (never the streaming `idx`); `id` is that id plus a generation suffix; and
     # resume keys on the former, so a re-run of this conversation is skipped.
@@ -544,7 +528,7 @@ def test_worker_row_identity_and_all_or_nothing_writes(tmp_path):
     # The boundary is the mask: prompt 0s then completion 1s.
     assert rows[0]["input_ids"] == [1, 2, 3, 4]
     assert rows[0]["loss_mask"] == [0, 0, 1, 1]
-    assert load_seen(str(out_path)) == ({"conv-abc"}, set())
+    assert load_seen(str(out_path)) == {"conv-abc"}
 
     # Turn 2 fails: turn 1's sample is discarded rather than half-written, which
     # is what lets load_seen treat one row as a finished conversation.
@@ -560,7 +544,7 @@ def test_worker_row_identity_and_all_or_nothing_writes(tmp_path):
     assert stats["errors"] == 1
     assert stats["truncated"] == 0
     assert out_path.read_text() == ""
-    assert load_seen(str(out_path)) == (set(), set())
+    assert load_seen(str(out_path)) == set()
     error = json.loads(err_path.read_text())
     assert error["id"] == "conv-abc"
     # The failed conversation still reports the row it had completed.

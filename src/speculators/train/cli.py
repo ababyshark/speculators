@@ -2,7 +2,9 @@
 
 import argparse
 import gc
+import json
 import logging
+import os
 import random
 import warnings
 from copy import deepcopy
@@ -21,6 +23,7 @@ from hs_connectors import HiddenStatesBackend
 from speculators.model import SpeculatorModel
 from speculators.models.eagle3.data import shift_batch
 from speculators.models.eagle3.rotary_partial import install_partial_neox_rotary
+from speculators.models.mtp.capture import CaptureManifest
 from speculators.models.mtp.data import shift_batch_mtp
 from speculators.models.utils import (
     get_verifier_config,
@@ -56,12 +59,17 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
 MROPE_INVERSE_TOLERANCE = 1e-6
 
 
-def set_seed(seed: int, deterministic: bool = False):
+def set_seed(
+    seed: int, deterministic: bool = False, deterministic_algorithms: bool = False
+):
     """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    if deterministic_algorithms:
+        torch.use_deterministic_algorithms(True)
 
     if deterministic:
         # For deterministic behavior (may impact performance)
@@ -502,6 +510,25 @@ def _build_from_config_only(
     return model
 
 
+def _draft_init_dtype() -> torch.dtype:
+    """Construction dtype for the draft model.
+
+    Defaults to fp32. ``SPECULATORS_INIT_DTYPE`` (e.g. ``bfloat16``) lowers
+    the pre-shard materialization peak for large MoE drafts; pair with
+    ``SPECULATORS_UPCAST_FP32=1`` on the trainer side to restore fp32 master
+    weights after FSDP sharding.
+    """
+    init_dtype = os.environ.get("SPECULATORS_INIT_DTYPE")
+    if not init_dtype:
+        return torch.float32
+    dtype = getattr(torch, init_dtype, None)
+    if dtype is None:
+        raise ValueError(
+            f"SPECULATORS_INIT_DTYPE={init_dtype!r} is not a torch dtype name"
+        )
+    return dtype
+
+
 def build_draft_model(
     args: argparse.Namespace,
     model_class: type[SpeculatorModel],
@@ -547,19 +574,33 @@ def build_draft_model(
             # __init__ resolves its own default ("sdpa") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
-            return model_class.from_pretrained(
+            model = model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
+                dtype=_draft_init_dtype(),
                 t2d=t2d,
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
             )
-        return model_class.from_pretrained(
-            args.from_pretrained,
-            t2d=t2d,
-            d2t=d2t,
-            verifier=args.verifier_name_or_path,
-        )
+        else:
+            model = model_class.from_pretrained(
+                args.from_pretrained,
+                dtype=_draft_init_dtype(),
+                t2d=t2d,
+                d2t=d2t,
+                verifier=args.verifier_name_or_path,
+            )
+        # Env-gated init dtype: on large MoE drafts the fp32 pre-shard
+        # materialization exceeds a single accelerator; bf16 load keeps the
+        # construction peak at ~half (FSDP2 shards right after, so steady
+        # state is unaffected).  NOTE: the explicit `.to(dtype)` is required —
+        # params synthesized outside the checkpoint load path (e.g. the fused
+        # MoE gate_up stack) ignore `dtype` and stay at their fp32
+        # construction dtype.
+        init_dtype = os.environ.get("SPECULATORS_INIT_DTYPE")
+        if init_dtype:
+            model.to(getattr(torch, init_dtype))
+        return model
 
     if args.speculator_type == "mtp":
         # MTP uses the verifier's own decoder config as the draft
@@ -615,6 +656,42 @@ def build_draft_model(
     )
 
 
+def _resolve_capture_manifest(
+    args: argparse.Namespace, draft_model: SpeculatorModel
+) -> CaptureManifest | None:
+    """Load/validate the teacher capture manifest for MTP training.
+
+    Only MTP draft models understand ``hidden_state_stage``; rejecting the flag
+    for other algorithms avoids leaking an unknown forward kwarg.  Without a
+    manifest a post-norm capability cannot prove its capture stage, so warn
+    loudly instead of silently assuming FastMTP's no-norm behavior.
+    """
+    capability = getattr(draft_model, "mtp_capability", None)
+    manifest_path = getattr(args, "capture_manifest", None)
+    if manifest_path:
+        if capability is None and getattr(args, "speculator_type", None) != "mtp":
+            raise ValueError(
+                "--capture-manifest is only supported for MTP draft models; "
+                f"got speculator_type={getattr(args, 'speculator_type', None)!r}."
+            )
+        manifest = CaptureManifest.from_path(manifest_path)
+        manifest.validate(
+            config=draft_model.config.transformer_layer_config,
+            verify_files=True,
+        )
+        return manifest
+
+    if capability is not None and capability.hidden_state_stage == "post_norm":
+        warnings.warn(
+            "GLM MTP captures are post-norm by default, but no "
+            "--capture-manifest was provided. The trainer cannot prove the "
+            "hidden-state stage and will run FastMTP without an extra norm; "
+            "pass the teacher capture manifest to make this explicit.",
+            stacklevel=2,
+        )
+    return None
+
+
 def main(cfg: TrainConfig):  # noqa: C901
     # Phase-1 adapter: the model layer still consumes a flat vars(args)-shaped
     # dict via **kwargs, so flatten the typed config back into a namespace here.
@@ -623,7 +700,7 @@ def main(cfg: TrainConfig):  # noqa: C901
     args = argparse.Namespace(**cfg.flatten())
 
     # Set random seed for reproducibility
-    set_seed(args.seed, args.deterministic_cuda)
+    set_seed(args.seed, args.deterministic_cuda, args.deterministic_algorithms)
 
     # Setup logging
     setup_root_logger()
@@ -653,8 +730,11 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Write the reproducibility artifacts (run.yaml + train_command.txt) next to
     # the checkpoints at rank 0 only, so every checkpoint carries the resolved
     # config that produced it.
+    provenance_path = (
+        Path(args.save_path) / "evaluation" if args.eval_only else Path(args.save_path)
+    )
     if get_rank() == 0:
-        cfg.save(args.save_path)
+        cfg.save(provenance_path)
 
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
 
@@ -720,6 +800,11 @@ def main(cfg: TrainConfig):  # noqa: C901
 
     hidden_size = draft_model.config.transformer_layer_config.hidden_size
 
+    # The capture manifest is the only proof of what the teacher hidden states
+    # contain (plan section 10.2). Validate it against the verifier config here
+    # so the dataloader only has to attach the stage.
+    capture_manifest = _resolve_capture_manifest(args, draft_model)
+
     # Setup dataloaders
     preprocess_fns = {
         "eagle3": shift_batch,
@@ -757,7 +842,9 @@ def main(cfg: TrainConfig):  # noqa: C901
         max_transfer_workers=args.max_transfer_workers,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        max_val_batches=args.max_val_batches,
         seed=args.seed,
+        capture_manifest=capture_manifest,
     )
 
     # Get trainer kwargs from model class
@@ -790,11 +877,19 @@ def main(cfg: TrainConfig):  # noqa: C901
         fsdp_shard=args.fsdp_shard,
         gradient_checkpointing=args.gradient_checkpointing,
         max_steps=args.max_steps,
+        eval_before_train=args.eval_before_train,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
-    # Run training
-    trainer.run_training()
+    # Evaluation shares checkpoint loading and the online data path with training.
+    if args.eval_only:
+        metrics = trainer.val_epoch(trainer.current_epoch)
+        if get_rank() == 0:
+            (provenance_path / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        if trainer.checkpointer.previous_epoch != -1:
+            trainer.maybe_update_best(trainer.checkpointer.previous_epoch, metrics)
+    else:
+        trainer.run_training()
 
     # Cleanup
     del trainer, draft_model

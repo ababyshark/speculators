@@ -662,3 +662,294 @@ def test_getitems_keeps_valid_samples_when_one_generation_fails(tmp_path):
     client = source.client
     assert isinstance(client, _QueuedAsyncOpenAI)
     assert client.requests == [[1, 2, 3], [1, 2, 3]]
+
+
+# ---------------------------------------------------------------------------
+# hidden_state_stage attachment (teacher capture manifest port)
+# ---------------------------------------------------------------------------
+
+
+class _StaticHiddenStates:
+    def __init__(self, sample: dict[str, torch.Tensor]):
+        self.sample = sample
+
+    def get_one(self, record: DatasetRecord) -> dict[str, torch.Tensor]:
+        return self.sample
+
+    def get_batch(self, records: list[DatasetRecord]) -> list[dict[str, torch.Tensor]]:
+        return [self.sample for _ in records]
+
+    def close(self) -> None:
+        pass
+
+
+def _stage_dataset(tmp_path: Path, stage: str | None) -> SpeculatorsDataset:
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[1, 1, 1]],
+            "seq_len": [3],
+        }
+    )
+    ds.save_to_disk(str(tmp_path / "data"))
+    records = ArrowDataset(datapath=str(tmp_path / "data"))
+    records.data.set_format(type="torch")
+    sample = {
+        "hidden_states": torch.ones(3, 1, 4),
+        "token_ids": torch.tensor([1, 2, 3]),
+    }
+    return SpeculatorsDataset(
+        records=records,
+        max_len=8,
+        hidden_states=_StaticHiddenStates(sample),
+        hidden_size=4,
+        num_target_layers=1,
+        hidden_state_stage=stage,
+    )
+
+
+def test_pad_samples_carries_agreeing_non_tensor_metadata():
+    """Run-level metadata (e.g. a capture stage) rides through collation."""
+    sample = {
+        "input_ids": torch.arange(2, dtype=torch.long),
+        "hidden_states": torch.randn(2, 4),
+        "lengths": torch.tensor([2], dtype=torch.long),
+    }
+    samples = [{**sample, "hidden_state_stage": "post_norm"} for _ in range(2)]
+    collated = _pad_samples(samples, 4, torch.float32)
+
+    assert collated["hidden_state_stage"] == "post_norm"
+
+
+def test_pad_samples_rejects_disagreeing_non_tensor_metadata():
+    sample = {
+        "input_ids": torch.arange(2, dtype=torch.long),
+        "hidden_states": torch.randn(2, 4),
+        "lengths": torch.tensor([2], dtype=torch.long),
+    }
+    batch = [
+        {**sample, "hidden_state_stage": "post_norm"},
+        {**sample, "hidden_state_stage": "pre_norm"},
+    ]
+
+    with pytest.raises(ValueError, match="differs across samples"):
+        _pad_samples(batch, 4, torch.float32)
+
+
+def test_dataset_attaches_manifest_stage_to_collated_batch(tmp_path):
+    dataset = _stage_dataset(tmp_path, "post_norm")
+
+    batch = dataset.__getitems__([0])
+
+    assert batch["hidden_state_stage"] == "post_norm"
+
+
+def test_dataset_omits_stage_without_manifest(tmp_path):
+    dataset = _stage_dataset(tmp_path, None)
+
+    batch = dataset.__getitems__([0])
+
+    assert "hidden_state_stage" not in batch
+
+
+def test_dataset_rejects_unknown_stage(tmp_path):
+    with pytest.raises(ValueError, match="hidden_state_stage"):
+        _stage_dataset(tmp_path, "mid_norm")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# create_train_val_loaders wiring (capture manifest -> batch stage)
+# ---------------------------------------------------------------------------
+
+
+class _LoaderFakeSource:
+    """Stands in for OfflineHiddenStatesSource in loader wiring tests."""
+
+    def __init__(self, *, transfer, on_missing):
+        self.transfer = transfer
+        self.on_missing = on_missing
+
+    def _sample(self) -> dict[str, torch.Tensor]:
+        return {
+            "hidden_states": torch.ones(3, 1, 4),
+            "token_ids": torch.tensor([1, 2, 3]),
+        }
+
+    def get_one(self, record: DatasetRecord) -> dict[str, torch.Tensor]:
+        return self._sample()
+
+    def get_batch(self, records: list[DatasetRecord]) -> list[dict[str, torch.Tensor]]:
+        return [self._sample() for _ in records]
+
+    def close(self) -> None:
+        pass
+
+
+def _write_loader_fixture(tmp_path: Path, **manifest_overrides) -> Path:
+    """Create an arrow dataset and a valid capture manifest; return its path."""
+    from safetensors.torch import save_file
+
+    from speculators.models.mtp.capture import (
+        build_capture_manifest,
+        write_capture_manifest,
+    )
+
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]] * 4,
+            "loss_mask": [[1, 1, 1]] * 4,
+            "seq_len": [3] * 4,
+        }
+    )
+    ds.set_format(type="torch")
+    ds.save_to_disk(str(tmp_path / "data"))
+    (tmp_path / "data" / "hidden_states").mkdir()
+
+    capture = tmp_path / "capture.safetensors"
+    save_file({"hidden_states": torch.ones(1, 3, 4)}, str(capture))
+    kwargs = {
+        "hidden_state_stage": "post_norm",
+        "verifier_source_layer_ordinal": 2,
+        "native_mtp_layer_index": 2,
+        "native_mtp_key_prefix": "model.layers.2.",
+        "vllm_target_layer_id": 2,
+        "hidden_size": 4,
+        "dtype": torch.bfloat16,
+        "input_bytes_sha256": "a" * 64,
+        "position_ids_sha256": "b" * 64,
+        "capture_files": [capture],
+        "model_norm_weight": torch.ones(4),
+        "verifier_source_indexer_type": "shared",
+        "model_norm_eps": 1e-5,
+    }
+    kwargs.update(manifest_overrides)
+    manifest_path = tmp_path / "capture_manifest.json"
+    write_capture_manifest(manifest_path, build_capture_manifest(**kwargs))
+    return manifest_path
+
+
+def _build_loaders(tmp_path: Path, manifest) -> tuple:
+    import speculators.train.dataloader as dataloader_module
+    from speculators.models.mtp.data import shift_batch_mtp
+
+    return dataloader_module.create_train_val_loaders(
+        data_path=str(tmp_path / "data"),
+        total_seq_len=8,
+        hidden_states_dtype=torch.bfloat16,
+        vllm_endpoint="",
+        on_missing="skip",
+        verifier_name_or_path="",
+        request_timeout=None,
+        max_retries=0,
+        generation_validation_retries=2,
+        max_consecutive_generation_failures=20,
+        hidden_size=4,
+        num_target_layers=1,
+        num_workers=0,
+        prefetch_factor=None,
+        preprocess=shift_batch_mtp,
+        train_data_ratio=0.5,
+        seed=0,
+        max_transfer_workers=1,
+        capture_manifest=manifest,
+    )
+
+
+def test_create_train_val_loaders_injects_manifest_stage(tmp_path, monkeypatch):
+    import speculators.train.dataloader as dataloader_module
+
+    manifest_path = _write_loader_fixture(tmp_path)
+    monkeypatch.setattr(
+        dataloader_module, "OfflineHiddenStatesSource", _LoaderFakeSource
+    )
+
+    train_loader, _ = _build_loaders(tmp_path, manifest_path)
+
+    batch = next(iter(train_loader))
+    assert batch["hidden_state_stage"] == "post_norm"
+    assert batch["error_records"] == 0
+
+
+def test_create_train_val_loaders_trusts_validated_manifest_object(
+    tmp_path, monkeypatch
+):
+    from speculators.models.mtp.capture import CaptureManifest
+
+    manifest_path = _write_loader_fixture(tmp_path)
+    manifest = CaptureManifest.from_path(manifest_path)
+    manifest.validate(verify_files=True)
+
+    calls = []
+    original = CaptureManifest.validate
+
+    def counting(self, **kwargs):
+        calls.append(kwargs)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(CaptureManifest, "validate", counting)
+    import speculators.train.dataloader as dataloader_module
+
+    monkeypatch.setattr(
+        dataloader_module, "OfflineHiddenStatesSource", _LoaderFakeSource
+    )
+
+    train_loader, _ = _build_loaders(tmp_path, manifest)
+
+    assert calls == []
+    batch = next(iter(train_loader))
+    assert batch["hidden_state_stage"] == "post_norm"
+
+
+def test_create_train_val_loaders_warns_on_dtype_mismatch(tmp_path, monkeypatch):
+    import speculators.train.dataloader as dataloader_module
+
+    manifest_path = _write_loader_fixture(tmp_path, dtype=torch.float32)
+    monkeypatch.setattr(
+        dataloader_module, "OfflineHiddenStatesSource", _LoaderFakeSource
+    )
+
+    with pytest.warns(UserWarning, match="dtype"):
+        train_loader, _ = _build_loaders(tmp_path, manifest_path)
+    assert next(iter(train_loader))["hidden_state_stage"] == "post_norm"
+
+
+def test_create_train_val_loaders_rejects_hidden_size_mismatch(tmp_path, monkeypatch):
+    import speculators.train.dataloader as dataloader_module
+
+    manifest_path = _write_loader_fixture(tmp_path, hidden_size=8)
+    monkeypatch.setattr(
+        dataloader_module, "OfflineHiddenStatesSource", _LoaderFakeSource
+    )
+
+    with pytest.raises(ValueError, match="hidden_size"):
+        _build_loaders(tmp_path, manifest_path)
+
+
+def test_no_pack_env_selects_nopack_sampler_end_to_end(tmp_path, monkeypatch):
+    """NO_PACK env wiring: the loader must use NoPackDistributedBatchSampler
+    and every yielded batch must carry exactly one document."""
+    from speculators.train.distributed_batch_sampler import (
+        MultipackDistributedBatchSamplerV2,
+        NoPackDistributedBatchSampler,
+    )
+
+    manifest_path = _write_loader_fixture(tmp_path)
+    monkeypatch.setattr(
+        __import__("speculators.train.dataloader", fromlist=["OfflineHiddenStatesSource"]),
+        "OfflineHiddenStatesSource",
+        _LoaderFakeSource,
+    )
+    monkeypatch.setenv("SPECULATORS_MTP_NO_PACK", "1")
+
+    train_loader, _ = _build_loaders(tmp_path, manifest_path)
+
+    assert isinstance(train_loader.batch_sampler, NoPackDistributedBatchSampler)
+    # 4 samples at ratio 0.5 -> train split of 2; R=1 -> one batch per sample.
+    assert len(train_loader) == 2
+    for batch in train_loader:
+        # Single document per batch: exactly one non-padding document id.
+        assert batch["document_ids"].unique().numel() == 2  # doc 0 + pad (-1)
+
+    monkeypatch.delenv("SPECULATORS_MTP_NO_PACK")
+    train_loader, _ = _build_loaders(tmp_path, manifest_path)
+    assert isinstance(train_loader.batch_sampler, MultipackDistributedBatchSamplerV2)
