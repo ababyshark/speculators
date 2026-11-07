@@ -1,6 +1,7 @@
 """GLM native MTP components; single-step training is the initial contract."""
 
 import copy
+import os
 from importlib.metadata import version as _package_version
 
 import torch
@@ -307,6 +308,45 @@ def _glm_chunked_ce(model, output, labels, valid, chunk_size=64):
     return total / denom, correct / denom, valid_count
 
 
+def _glm_chunked_distill(model, output, v_hidden, valid, temp, chunk_size=64):
+    """KL(drafter || verifier) over supervised positions, verifier under no_grad.
+
+    v_hidden holds the verifier's final-norm hidden states at the label
+    positions' preceding index, so model.lm_head(v_hidden) IS the verifier's
+    next-token distribution - the acceptance-aligned distillation target.
+    Logs drafter-argmax vs verifier-argmax agreement per chunk (acceptance proxy).
+    """
+    import os
+
+    total = output.new_zeros((), dtype=torch.float32)
+    agree = output.new_zeros((), dtype=torch.float32)
+    denom = valid.sum().clamp_min(1)
+    for start in range(0, output.shape[1], chunk_size):
+        end = min(start + chunk_size, output.shape[1])
+        m = valid[:, start:end]
+        with torch.no_grad():
+            v_logits = model.lm_head(v_hidden[:, start:end]).float()
+
+        def chunk_kl(h, vh, mask):
+            d_logits = model.lm_head(h).float()
+            n = mask.sum().clamp_min(1)
+            log_p = torch.log_softmax(d_logits[mask] / temp, dim=-1)
+            q = torch.softmax(vh[mask] / temp, dim=-1)
+            kl = (q * (torch.log_softmax(vh[mask] / temp, dim=-1) - log_p)).sum(-1)
+            ag = ((d_logits.argmax(-1) == vh.argmax(-1)) & mask).sum().float()
+            return kl.sum() * (temp * temp), ag
+
+        from torch.utils.checkpoint import checkpoint
+
+        value, ag = checkpoint(
+            chunk_kl, output[:, start:end], v_hidden[:, start:end], m,
+            use_reentrant=False,
+        )
+        total = total + value
+        agree = agree + ag
+    return total / denom, agree / denom
+
+
 def forward_glm_mtp(
     model,
     input_ids,
@@ -418,11 +458,24 @@ def forward_glm_mtp(
             if loss_mask is None
             else loss_mask[:, token_start + 1 : token_start + 1 + valid_len].bool()
         )
-        step_loss, step_acc, count = _glm_chunked_ce(
-            model,
-            output,
-            labels,
-            valid,
+        distill_alpha = float(os.environ.get("SPECULATORS_MTP_DISTILL_ALPHA", "0"))
+        distill_temp = float(os.environ.get("SPECULATORS_MTP_DISTILL_TEMP", "2.0"))
+        if distill_alpha > 0:
+            v_slice = hidden_states[:, token_start : token_start + valid_len]
+            d_loss, d_agree = _glm_chunked_distill(
+                model, output, v_slice, valid, distill_temp
+            )
+            metrics[f"align_step_{step}"] = d_agree.detach()
+            step_loss, step_acc, count = _glm_chunked_ce(
+                model, output, labels, valid,
+            )
+            step_loss = distill_alpha * d_loss + (1 - distill_alpha) * step_loss
+        else:
+            step_loss, step_acc, count = _glm_chunked_ce(
+                model,
+                output,
+                labels,
+                valid,
             chunk_size=chunk_size,
         )
         weight = 1.0 if step_weights is None else float(step_weights[step])
