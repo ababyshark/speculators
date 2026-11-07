@@ -308,15 +308,17 @@ def _glm_chunked_ce(model, output, labels, valid, chunk_size=64):
     return total / denom, correct / denom, valid_count
 
 
-def _glm_chunked_distill(model, output, v_hidden, valid, temp, chunk_size=64):
-    """KL(drafter || verifier) over supervised positions, verifier under no_grad.
+def _glm_chunked_distill(model, output, v_hidden, valid, chunk_size=64):
+    """TV-distance distillation over supervised positions (verifier no_grad).
 
     v_hidden holds the verifier's final-norm hidden states at the label
     positions' preceding index, so model.lm_head(v_hidden) IS the verifier's
-    next-token distribution - the acceptance-aligned distillation target.
-    Logs drafter-argmax vs verifier-argmax agreement per chunk (acceptance proxy).
+    next-token distribution. tv_loss per speculators.losses: minimizing
+    1 - sum min(p,q) directly optimizes the speculative acceptance rate
+    (DSpark-proven combination: 0.1 CE + 0.9 TV).
+    Logs drafter-argmax vs verifier-argmax agreement (acceptance proxy).
     """
-    import os
+    from speculators.losses.eager import tv_loss
 
     total = output.new_zeros((), dtype=torch.float32)
     agree = output.new_zeros((), dtype=torch.float32)
@@ -327,19 +329,17 @@ def _glm_chunked_distill(model, output, v_hidden, valid, temp, chunk_size=64):
         with torch.no_grad():
             v_logits = model.lm_head(v_hidden[:, start:end]).float()
 
-        def chunk_kl(h, vh, mask):
+        def chunk_tv(h, vh, mask):
             d_logits = model.lm_head(h).float()
-            n = mask.sum().clamp_min(1)
-            log_p = torch.log_softmax(d_logits[mask] / temp, dim=-1)
-            q = torch.softmax(vh[mask] / temp, dim=-1)
-            kl = (q * (torch.log_softmax(vh[mask] / temp, dim=-1) - log_p)).sum(-1)
+            tv = tv_loss(d_logits, vh)[0]
+            tv = (tv * mask).sum() / mask.sum().clamp_min(1)
             ag = ((d_logits.argmax(-1) == vh.argmax(-1)) & mask).sum().float()
-            return kl.sum() * (temp * temp), ag
+            return tv, ag
 
         from torch.utils.checkpoint import checkpoint
 
         value, ag = checkpoint(
-            chunk_kl, output[:, start:end], v_hidden[:, start:end], m,
+            chunk_tv, output[:, start:end], v_hidden[:, start:end], m,
             use_reentrant=False,
         )
         total = total + value
@@ -459,12 +459,9 @@ def forward_glm_mtp(
             else loss_mask[:, token_start + 1 : token_start + 1 + valid_len].bool()
         )
         distill_alpha = float(os.environ.get("SPECULATORS_MTP_DISTILL_ALPHA", "0"))
-        distill_temp = float(os.environ.get("SPECULATORS_MTP_DISTILL_TEMP", "2.0"))
         if distill_alpha > 0:
             v_slice = hidden_states[:, token_start : token_start + valid_len]
-            d_loss, d_agree = _glm_chunked_distill(
-                model, output, v_slice, valid, distill_temp
-            )
+            d_loss, d_agree = _glm_chunked_distill(model, output, v_slice, valid)
             metrics[f"align_step_{step}"] = d_agree.detach()
             step_loss, step_acc, count = _glm_chunked_ce(
                 model, output, labels, valid,

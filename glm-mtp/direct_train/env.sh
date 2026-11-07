@@ -14,7 +14,7 @@ export DATA_PATH=$BASE/data_prep_rot          # Arrow: input_ids/loss_mask/seq_l
 # --- outputs ---
 export RUN_ROOT=/mnt/weight2/l00840580-direct-v13
 export HS_PATH=$RUN_ROOT/hidden_states        # ~84GB (3 layers x 2052 records)
-export SAVE_PATH=$RUN_ROOT/checkpoints
+export SAVE_PATH=$RUN_ROOT/checkpoints_v14
 export LOG_DIR=$RUN_ROOT/logs
 export HYBRID_OUT=$RUN_ROOT/hybrid
 
@@ -24,6 +24,8 @@ export LR=1e-5
 export WEIGHT_DECAY=0.1
 export EPOCHS=1
 export MAX_STEPS=231  # full epoch: 1848 train samples / 8 ranks
+export SPECULATORS_MTP_DISTILL_ALPHA=0.9
+export SPECULATORS_MTP_DISTILL_TEMP=2.0
 export CHECKPOINT_FREQ=20
 export TRAIN_RATIO=0.9006
 export TOTAL_SEQ_LEN=2304                     # >= max seq_len 2281 (padding-only, semantic-neutral)
