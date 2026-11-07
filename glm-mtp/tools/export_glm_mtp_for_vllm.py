@@ -94,10 +94,18 @@ def requant_writeback(cp: Path, target: Path, out: Path, layer: int) -> dict:
     if len(mapped) != len(train_keys):
         raise RuntimeError("Reverse mapping is not bijective")
     native_keys = {k for k in weight_map if k.startswith(prefix)}
+    # a30-era training checkpoints omit the shared embed/head (stored in
+    # mtp_shared_weights_path); keep the target's original quantized bytes for
+    # them via the existing-tensor carry-over in the shard rewrite below.
+    shared_exempt = {
+        f"{prefix}embed_tokens.weight",
+        f"{prefix}shared_head.head.weight",
+    }
     unmapped = (
         native_keys
         - set(mapped)
         - {k for k in native_keys if k.endswith(meta_suffixes)}
+        - shared_exempt
     )
     if unmapped:
         raise RuntimeError({"layer tensors without a trained source": sorted(unmapped)})

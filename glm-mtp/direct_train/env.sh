@@ -23,7 +23,7 @@ export NUM_SPEC_STEPS=1
 export LR=1e-5
 export WEIGHT_DECAY=0.1
 export EPOCHS=1
-export MAX_STEPS=100
+export MAX_STEPS=231  # full epoch: 1848 train samples / 8 ranks
 export CHECKPOINT_FREQ=20
 export TRAIN_RATIO=0.9006
 export TOTAL_SEQ_LEN=2304                     # >= max seq_len 2281 (padding-only, semantic-neutral)
