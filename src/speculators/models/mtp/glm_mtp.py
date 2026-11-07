@@ -326,14 +326,14 @@ def _glm_chunked_distill(model, output, v_hidden, valid, chunk_size=64):
     for start in range(0, output.shape[1], chunk_size):
         end = min(start + chunk_size, output.shape[1])
         m = valid[:, start:end]
-        with torch.no_grad():
-            v_logits = model.lm_head(v_hidden[:, start:end]).float()
 
         def chunk_tv(h, vh, mask):
+            with torch.no_grad():
+                v_logits = model.lm_head(vh).float()
             d_logits = model.lm_head(h).float()
-            tv = tv_loss(d_logits, vh)[0]
+            tv = tv_loss(d_logits, v_logits)[0]
             tv = (tv * mask).sum() / mask.sum().clamp_min(1)
-            ag = ((d_logits.argmax(-1) == vh.argmax(-1)) & mask).sum().float()
+            ag = ((d_logits.argmax(-1) == v_logits.argmax(-1)) & mask).sum().float()
             return tv, ag
 
         from torch.utils.checkpoint import checkpoint
