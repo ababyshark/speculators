@@ -1,0 +1,18 @@
+{
+ "data": "/mnt/share_space/l00840580/dspark-glm53/data_prep_rot",
+ "checks": {
+  "rows": 2052,
+  "columns_ok": true,
+  "len_mismatch_rows": 0,
+  "empty_loss_mask_rows": 0,
+  "out_of_vocab_rows": 0,
+  "vocab_size": 154880,
+  "seq_len_min": 214,
+  "seq_len_max": 2281,
+  "total_tokens_m": 2.3,
+  "train_rows": 1848,
+  "val_rows": 204,
+  "hs_storage_gb": 84.7
+ },
+ "status": "PASS"
+}
