@@ -1,5 +1,11 @@
 # GLM-5.3 W4A8 MTP 蒸馏增训 — 交接手册（HANDOFF）
 
+> **固定路径（所有机器同路径可读）**：`/mnt/share_space/l00840580/speculators-work/`
+> - 本手册：`speculators-work/HANDOFF.md`
+> - 全部脚本+测试+工具：`speculators-work/glm-mtp-direct/`（含 env.sh、40_train.sh、
+>   export_glm_mtp_for_vllm.py、eval_ab.py、tests/ 等，无需 GitHub 也可运行）
+> - GitHub 权威副本：`ababyshark/speculators` 分支 `glm-mtp5-v2` @ `efc028a`
+
 > 日期：2026-11-08 ｜ 分支：`glm-mtp5-v2` @ `49011f5`（GitHub: ababyshark/speculators，已推送）
 > 运行机器：**10.246.63.40**（A3-syn-30，root，16 卡，容器 `vllm_ascend_v0.30.0`）
 > 本机（调试容器 10.246.63.12）释放后，**全部训练活动只依赖 40 机 + GitHub 仓库**。
