@@ -95,3 +95,39 @@ python3 glm-mtp/tests/test_eval_sanity.py <out.json>   # 必跑
 - 训练日志只有 align_step_0：步数未生效（cli.py 已修，monitor F1 兜底）
 - resume 报 Missing optimizer state：换 SAVE_PATH 或 `--no-resume-from-checkpoint`
 - 磁盘清理曾删除 HS 库/hybrid/checkpoints：重要产物先确认再清
+
+## 8. B 实验终局与 on-policy 生成配方（2026-11-09）
+
+### 8.1 最终三对比（同集：on-policy 32 条；结论详见根 HANDOFF §1.9）
+
+| 位置 | A 原始（官方 W4A8） | A float（init float） | B float（v19 训练） | 训练差     |
+| ---- | ------------------- | --------------------- | ------------------- | ---------- |
+| mean | 3.390               | 3.396                 | 3.304               | **-0.092** |
+
+**结论**：通用文本 + 小规模微调 = 负增益；官方 W4A8 包直接交付（native = A_float）。 MTP 层量化在此分布上零损失；评测集选择对绝对值的影响 >> 模型改动。
+
+### 8.2 on-policy 数据生成配方（投机解码加速，24x）
+
+1. 抽样（seed 42）：`python3 gen_onpolicy_v3.py a|b`（各 150 条，断点续跑 jsonl）
+2. 双端点：`serve_gen.sh`（PORT/DEVICES/TAG 环境变量，v18 float 包 + MTP×5，12 workers） —— 投机解码生成与纯 greedy 输出逐 token 等价（贪心验证数学保证），300 条 16.5 分钟
+3. 已知坑：此构建 completions 响应 `token_ids` 恒为 null → 生成存 text， `assemble_onpolicy_v2.py` 全序列重编码 + roundtrip 校验，产出 Arrow + 32 条评测集
+4. 评测：`EVAL_BASE=http://127.0.0.1:8102 python3 glm-mtp/eval_ab.py ...` （BASE 已参数化，支持多端点并行评测）
+5. 注意 `--save-best`：最优 checkpoint 在数字目录（如 `checkpoints_v19/3`），导出用 `checkpoint_best` 符号链接指向，勿假定 `0`
+
+
+## 9. 领域适配终局（v20，2026-11-10）：八连负与最终结论
+
+xql-cases（内部昇腾部署案例 4588 md）→ RAG-QA/摘要/抽取 prompt 464 条 → on-policy 生成
+（双端点投机解码，400 条 8.7 分钟）→ v20 训练（agree 0.954、val/align 0.823）→ 同集三对比：
+A 原始 3.224/3.640 vs A float 3.324/3.729 vs **B v20 3.058/3.380（训练差 -0.27/-0.35）**。
+
+**v13-v20 八连负**：可及规模（≤2052 条）下任何微调都使工厂 drafter 变差，训练越重劣化越大。
+交付结论：MTP 直接用官方 W4A8 包；微调正向空间需工业级数据规模 + 真实分布差异。
+完整证据链见根 HANDOFF §1.6-1.10。
+
+### 9.1 领域数据管线脚本（可复用）
+- `xql_build_prompts.py`：案例 md/CSV → 四风格 prompt（RAG-QA/摘要/抽取/CSV-QA）
+- `xql_gen_v1.py` / `gen_onpolicy_v3.py`：on-policy 生成（投机解码端点 + 断点续跑）
+- `assemble_xql.py` / `assemble_onpolicy_v2.py`：text 重编码 + roundtrip 校验 → Arrow
+- `serve_gen.sh` / `serve_native.sh`：生成端点（PORT/DEVICES/TAG 环境变量）
+- `watchdog_xql2.sh`：双端点看门狗（30s 检活，kill→120s→重启→等就绪）

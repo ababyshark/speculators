@@ -1,5 +1,14 @@
 # Speculators — Agent Guide
 
+## GLM MTP5: RFC-first workflow
+
+[glm-mtp/docs/RFC_glm_mtp5.md](./glm-mtp/docs/RFC_glm_mtp5.md) is the **normative specification and single source of truth** for all GLM MTP5 work. It exists so that an agent can (re)implement the system from the RFC alone, without reading the current implementation.
+
+- **Spec first**: new GLM MTP5 features start as a numbered requirement (`REQ-*`) or decision record (`ADR-*`) in the RFC; the implementation follows it. Do not reverse-engineer the RFC from code — the RFC leads.
+- **Spec, not code**: the RFC carries at most pseudocode. Keep semantics precise (index alignment, normalization, error table) instead of pasting implementations. The RFC is written forward-design: motivation → principles (§2) → alternatives (§3) → end-to-end (§4) → normative spec (§8-10) → acceptance (§6, §15-16).
+- **Keep it current**: any implementation deviation, new decision, or resolved open item (`OPEN-*`) MUST be written back into the RFC in the same change. Accepted gates (`G-A*`) and the test matrix (`T-*`) are the acceptance contract.
+- Known legacy defects are recorded as fixed target semantics in RFC §12 (`DFX-*`) — re-implementations MUST use the fixed behavior, not the historical one. Field-incident lessons are distilled into RFC §13 engineering rules (`E-*`) — code review checks against that list.
+
 ## Pull requests
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before contributing. Install the git hooks once per clone, after installing the `[dev]` extras:

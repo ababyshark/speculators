@@ -11,7 +11,9 @@ import sys
 import time
 import urllib.request
 
-BASE = "http://127.0.0.1:8100"
+import os as _os
+
+BASE = _os.environ.get("EVAL_BASE", "http://127.0.0.1:8100")
 POS_RE = re.compile(
     r'vllm:spec_decode_num_accepted_tokens_per_pos_total\{[^}]*position="(\d)"[^}]*\}\s+([\d.e+]+)'
 )
