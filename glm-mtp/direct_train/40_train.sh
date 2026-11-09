@@ -46,7 +46,7 @@ python3 -m torch.distributed.run --nproc-per-node 8 \
   --save-path $SAVE_PATH \
   --fsdp-shard --deterministic-algorithms \
   --max-steps $MAX_STEPS --log-freq 1 --logger '' \
-  --log-dir $LOG_DIR --run-name glm53_mtp_direct_v13 \
+  --log-dir $LOG_DIR --run-name glm53_mtp_direct_v15_distill5 \
   2>&1 | tee $LOG_DIR/train_v13.log | grep -E "loss|step|checkpoint|Error" || true
 
 echo "== [3] done; latest checkpoints: =="
