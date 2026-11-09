@@ -20,10 +20,11 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
 _transformers_version = tuple(
     int(part) for part in _package_version("transformers").split(".")[:2]
 )
-if not (5, 15) <= _transformers_version < (5, 19):
+if not (5, 14) <= _transformers_version < (5, 19):
     raise ImportError(
-        "GLM MTP requires transformers>=5.15,<5.19: the glm_moe_dsa "
-        "router/rotary APIs it builds on are not stable across 5.x; "
+        "GLM MTP requires transformers>=5.14,<5.19: the glm_moe_dsa "
+        "router/rotary APIs it builds on are not stable across 5.x "
+        "(5.14-5.18 verified in production); "
         f"found {_package_version('transformers')}"
     )
 
@@ -238,10 +239,23 @@ def load_native_shared_weights(model):
     model.mtp_layers[0].self_attn.indexer.requires_grad_(False)
 
 
+_CAUSAL_MASK_ROW_CHUNK = 4096
+
+
 def _glm_causal_mask(length, dtype, device):
-    causal = torch.ones((length, length), dtype=torch.bool, device=device).triu(1)
-    mask = torch.zeros((1, 1, length, length), dtype=dtype, device=device)
-    return mask.masked_fill(causal, torch.finfo(dtype).min)
+    # Row-chunked construction: one [1,1,L,L] buffer plus a [chunk, L] bool
+    # stripe at a time. The previous three-step version (bool[L,L] +
+    # zeros[1,1,L,L] + masked_fill) held two full-size buffers simultaneously,
+    # ~792MB peak at 16K bf16 vs ~600MB here. Element-wise equivalent.
+    fill = torch.finfo(dtype).min
+    mask = torch.full((1, 1, length, length), fill, dtype=dtype, device=device)
+    for start in range(0, length, _CAUSAL_MASK_ROW_CHUNK):
+        end = min(start + _CAUSAL_MASK_ROW_CHUNK, length)
+        rows = torch.arange(start, end, device=device)
+        cols = torch.arange(length, device=device)
+        allowed = cols[None, :] <= rows[:, None]
+        mask[0, 0, start:end].masked_fill_(allowed, 0.0)
+    return mask
 
 
 def _glm_layer_step(model, hidden, token_embeddings, mask, pos):
@@ -373,6 +387,37 @@ def _glm_chunked_argmax(model, h, chunk_size=64):
     return out
 
 
+def _glm_zero_supervision_result(hidden_states):
+    """Graph-connected zero-loss result for batches with nothing to supervise.
+
+    The zero is built from ``hidden_states.sum() * 0.0`` so the backward graph
+    keeps a DTensor-safe edge to the input under FSDP. Trainer skips backward
+    when ``loss.requires_grad`` is False.
+    """
+    zero = hidden_states.sum(dtype=torch.float32) * 0.0
+    return (
+        [],
+        zero,
+        {
+            "loss_sum": zero.detach(),
+            "loss_total": zero.new_tensor(1.0),
+            "loss": zero.detach(),
+            "supervised_tokens": zero.detach(),
+        },
+    )
+
+
+def _glm_resolve_chunk_size(chunk_size):
+    """Peak-memory lever for long contexts: each chunk materializes
+    chunk x vocab logits. Explicit arg > SPECULATORS_MTP_CHUNK_SIZE > 64."""
+    if chunk_size is None:
+        chunk_size = int(os.environ.get("SPECULATORS_MTP_CHUNK_SIZE", "64"))
+    chunk_size = int(chunk_size)
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    return chunk_size
+
+
 def forward_glm_mtp(
     model,
     input_ids,
@@ -383,7 +428,7 @@ def forward_glm_mtp(
     step_weights=None,
     document_ids=None,
     num_speculative_steps=None,
-    chunk_size=64,
+    chunk_size=None,
     **kwargs,
 ):
     """Teacher-forced GLM MTP recurrence for one native MTP layer.
@@ -391,9 +436,10 @@ def forward_glm_mtp(
     GLM-5.3 ships one native MTP layer. For a speculative depth greater than
     one, the same layer is applied recursively to the previous draft hidden
     states with teacher-forced token embeddings. This is the implementation
-    needed for the first five-step smoke test; vLLM parity must still be
+    needed for the first five-step smoke test;     vLLM parity must still be
     checked before using it for a production run.
     """
+    chunk_size = _glm_resolve_chunk_size(chunk_size)
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
         raise ValueError(
             "Initial GLM MTP implementation requires one unpacked sequence"
@@ -401,6 +447,12 @@ def forward_glm_mtp(
     if document_ids is not None:
         real = document_ids >= 0
         length = int(real.sum())
+        if length == 0:
+            # Empty recovery batch: --on-missing generate produces an all-pad
+            # placeholder (document_ids all -1) when teacher requests fail.
+            # Return a graph-connected zero loss instead of crashing on the
+            # packed-documents check below with a misleading error.
+            return _glm_zero_supervision_result(hidden_states)
         if not bool(real[:, :length].all()) or bool(real[:, length:].any()):
             raise ValueError("Only right padding is supported")
         docs = document_ids[:, :length]
@@ -491,7 +543,9 @@ def forward_glm_mtp(
             # verifier argmax for token j+1: slot 0 feeds the MTP layer
             # (token at token_start), slots 1.. serve as target argmax.
             v_tok = _glm_chunked_argmax(
-                model, hidden_states[:, token_start - 1 : token_start + valid_len]
+                model,
+                hidden_states[:, token_start - 1 : token_start + valid_len],
+                chunk_size=chunk_size,
             )
             token_embeddings = model.embed_tokens(v_tok[:, :valid_len])
         else:
@@ -511,7 +565,7 @@ def forward_glm_mtp(
                 v_arg = (
                     v_tok[:, 1 : valid_len + 1]
                     if teacher_force
-                    else _glm_chunked_argmax(model, v_slice)
+                    else _glm_chunked_argmax(model, v_slice, chunk_size=chunk_size)
                 )
                 valid_eff = (labels == v_arg) & valid
                 metrics[f"agree_rate_step_{step}"] = (
@@ -519,13 +573,16 @@ def forward_glm_mtp(
                 ).detach()
             else:
                 valid_eff = valid
-            d_loss, d_agree = _glm_chunked_distill(model, output, v_slice, valid_eff)
+            d_loss, d_agree = _glm_chunked_distill(
+                model, output, v_slice, valid_eff, chunk_size=chunk_size
+            )
             metrics[f"align_step_{step}"] = d_agree.detach()
             step_loss, step_acc, count = _glm_chunked_ce(
                 model,
                 output,
                 labels,
                 valid_eff,
+                chunk_size=chunk_size,
             )
             step_loss = distill_alpha * d_loss + (1 - distill_alpha) * step_loss
         else:

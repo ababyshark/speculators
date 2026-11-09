@@ -794,6 +794,8 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             "step_weights": step_weights,
             "train_forward": kwargs.get("mtp_train_forward", "fastmtp"),
         }
+        if kwargs.get("mtp_chunk_size"):
+            train_kwargs["chunk_size"] = int(kwargs["mtp_chunk_size"])
         val_kwargs = train_kwargs.copy()
 
         return train_kwargs, val_kwargs

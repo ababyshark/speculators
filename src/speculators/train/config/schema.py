@@ -635,6 +635,13 @@ class MTPArgs(_Group):
     num_speculative_steps: int = Field(
         default=3, description="Number of MTP prediction steps (default: 3)."
     )
+    mtp_chunk_size: int | None = Field(
+        default=None,
+        description="GLM MTP chunk size in tokens per lm_head/CE/distill chunk; "
+        "peak-memory lever for long contexts (each chunk materializes "
+        "chunk x vocab logits). Default: 64, or SPECULATORS_MTP_CHUNK_SIZE "
+        "when set. Only used with GLM MTP.",
+    )
     step_weight_beta: float = Field(
         default=0.6,
         description="Exponential decay factor for MTP step weights; higher weights "
