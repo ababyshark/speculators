@@ -123,7 +123,7 @@ class HiddenStatesBackend(ABC):
 
 
 def _load_hs_file(
-    file_path: Path, lock_timeout: float = 10.0
+    file_path: Path, lock_timeout: float = 1800.0
 ) -> dict[str, torch.Tensor] | None:
     lock_path = str(file_path) + ".lock"
     if Path(lock_path).exists():
@@ -138,7 +138,7 @@ def _load_hs_file(
 class FileTransfer(HiddenStatesTransfer):
     """File-system based hidden-states transfer (shared filesystem)."""
 
-    def __init__(self, hidden_states_path: Path, *, lock_timeout: float = 10.0):
+    def __init__(self, hidden_states_path: Path, *, lock_timeout: float = 1800.0):
         if not math.isfinite(lock_timeout) or lock_timeout <= 0:
             raise ValueError("lock_timeout must be finite and greater than zero")
         self.hidden_states_path = hidden_states_path
@@ -181,7 +181,7 @@ class FileBackend(HiddenStatesBackend):
             parser,
             "--hidden-states-lock-timeout",
             type=float,
-            default=10.0,
+            default=1800.0,
             help="Seconds to wait for asynchronous file writes after the HTTP response.",
         )
 
@@ -206,7 +206,7 @@ class FileBackend(HiddenStatesBackend):
             else Path(data_path) / "hidden_states"
         )
         return FileTransfer(
-            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0)
+            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 1800.0)
         )
 
     @staticmethod
@@ -239,7 +239,7 @@ class FP8Transfer(FileTransfer):
         hidden_states_path: Path,
         dequantize_dtype: torch.dtype = torch.bfloat16,
         *,
-        lock_timeout: float = 10.0,
+        lock_timeout: float = 1800.0,
     ):
         super().__init__(hidden_states_path, lock_timeout=lock_timeout)
         self.dequantize_dtype = dequantize_dtype
@@ -308,7 +308,7 @@ class FP8Backend(HiddenStatesBackend):
             else Path(data_path) / "hidden_states"
         )
         return FP8Transfer(
-            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 10.0)
+            hs_path, lock_timeout=getattr(args, "hidden_states_lock_timeout", 1800.0)
         )
 
     @staticmethod

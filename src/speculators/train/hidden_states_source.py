@@ -260,9 +260,12 @@ class VllmHiddenStatesSource:
             )
             receipt = GenerationReceipt(handle, transfer_params)
             future = transfer_executor.submit(self._load_generated, record, receipt)
-            while not future.done():  # noqa: ASYNC110 - keep request tasks running
-                await asyncio.sleep(0.001)
-            return future.result()
+            # Await the executor future without spinning: the previous
+            # `while not future.done(): await asyncio.sleep(0.001)` polled at
+            # 1ms inside the event loop, starving it under high lock-wait
+            # concurrency (16-rank eventfd_read deadlock). wrap_future yields
+            # to the loop and wakes only on completion.
+            return await asyncio.wrap_future(future)
 
         return await self.generation_recovery.run_async(
             generate_and_transfer,
