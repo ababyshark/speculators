@@ -775,7 +775,27 @@ def main(cfg: TrainConfig):  # noqa: C901
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
 
     if args.speculator_type == "mtp":
+        model_steps = draft_model.config.num_speculative_steps
+        if args.num_speculative_steps != model_steps:
+            # v15 lesson: silently overwriting the CLI flag with the draft
+            # config value made a 5-step run train single-step (log showed
+            # zero align_step_1..4). Honor the explicit CLI flag instead.
+            logger.info(
+                "--num-speculative-steps %d overrides draft model config "
+                "speculative_tokens %d",
+                args.num_speculative_steps,
+                model_steps,
+            )
+            draft_model.config.speculators_config.proposal_methods[
+                0
+            ].speculative_tokens = args.num_speculative_steps  # type: ignore[union-attr,attr-defined]
         args.num_speculative_steps = draft_model.config.num_speculative_steps
+        logger.info(
+            "MTP num_speculative_steps resolved to %d "
+            "(monitor: align_step_0..%d expected in train log)",
+            args.num_speculative_steps,
+            args.num_speculative_steps - 1,
+        )
 
     # Dry-run: persist an initialized checkpoint and exit before training so the
     # config/weights can be validated (e.g. in vLLM). The saved checkpoint can be
