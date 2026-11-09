@@ -246,7 +246,17 @@ def _glm_causal_mask(length, dtype, device):
 
 def _glm_layer_step(model, hidden, token_embeddings, mask, pos):
     rotary = model.rotary_emb(hidden, pos)
-    if model.training and getattr(model.config, "mtp_activation_checkpoint", True):
+    # FSDP2 + multi-step recursion: layer-checkpoint recompute can hit
+    # "mixed torch.Tensor and DTensor" (plain saved inputs vs DTensor
+    # weights). SPECULATORS_MTP_ACTIVATION_CKPT=0 skips the layer
+    # checkpoint so backward never recomputes it; chunk-level checkpoints
+    # are unaffected. Memory cost: per-step layer activations stay live.
+    ckpt_env = os.environ.get("SPECULATORS_MTP_ACTIVATION_CKPT", "1")
+    if (
+        model.training
+        and ckpt_env not in ("0", "false", "False")
+        and getattr(model.config, "mtp_activation_checkpoint", True)
+    ):
         from torch.utils.checkpoint import checkpoint
 
         def layer_forward(h, tok, attn_mask, positions, rotary_emb):
@@ -339,12 +349,28 @@ def _glm_chunked_distill(model, output, v_hidden, valid, chunk_size=64):
         from torch.utils.checkpoint import checkpoint
 
         value, ag = checkpoint(
-            chunk_tv, output[:, start:end], v_hidden[:, start:end], m,
+            chunk_tv,
+            output[:, start:end],
+            v_hidden[:, start:end],
+            m,
             use_reentrant=False,
         )
         total = total + value
         agree = agree + ag
     return total / denom, agree / denom
+
+
+def _glm_chunked_argmax(model, h, chunk_size=64):
+    """No-grad verifier argmax tokens: out[:, i] = argmax lm_head(h[:, i]),
+    i.e. the verifier-preferred token at the position AFTER h[:, i]."""
+    out = torch.empty((1, h.shape[1]), dtype=torch.long, device=h.device)
+    with torch.no_grad():
+        for start in range(0, h.shape[1], chunk_size):
+            end = min(start + chunk_size, h.shape[1])
+            out[:, start:end] = (
+                model.lm_head(h[:, start:end].detach()).float().argmax(-1)
+            )
+    return out
 
 
 def forward_glm_mtp(
@@ -439,6 +465,17 @@ def forward_glm_mtp(
     causal_mask = _glm_causal_mask(valid_len, hidden_states.dtype, hidden_states.device)
     metrics = {}
     weighted_losses = []
+    # v17 objective fixes (A_float=2.908 lesson: teacher-forcing data tokens
+    # optimizes contexts serving never visits). Both flags need the distill
+    # branch (verifier argmax comes from the captured verifier hidden states).
+    _distill_env = os.environ.get("SPECULATORS_MTP_DISTILL_ALPHA", "0")
+    distill_alpha = float(_distill_env) if _distill_env else 0.0
+    agree_filter = distill_alpha > 0 and os.environ.get(
+        "SPECULATORS_MTP_AGREE_FILTER", "0"
+    ) not in ("0", "false", "False")
+    teacher_force = distill_alpha > 0 and os.environ.get(
+        "SPECULATORS_MTP_TEACHER_FORCE_VERIFIER", "0"
+    ) not in ("0", "false", "False")
     if step_weights is None:
         beta = float(getattr(model.config, "step_weight_beta", 0.6))
         raw_weights = [beta**i for i in range(effective_steps)]
@@ -448,9 +485,19 @@ def forward_glm_mtp(
         hidden_step = current_hidden[:, :valid_len]
         pos = position_ids[:, :valid_len]
         token_start = step + 1
-        token_embeddings = model.embed_tokens(
-            input_ids[:, token_start : token_start + valid_len].long()
-        )
+        if teacher_force:
+            # One no-grad lm_head pass over hidden_states[token_start-1 :
+            # token_start+valid_len] yields, for source position j, the
+            # verifier argmax for token j+1: slot 0 feeds the MTP layer
+            # (token at token_start), slots 1.. serve as target argmax.
+            v_tok = _glm_chunked_argmax(
+                model, hidden_states[:, token_start - 1 : token_start + valid_len]
+            )
+            token_embeddings = model.embed_tokens(v_tok[:, :valid_len])
+        else:
+            token_embeddings = model.embed_tokens(
+                input_ids[:, token_start : token_start + valid_len].long()
+            )
         output = _glm_layer_step(model, hidden_step, token_embeddings, causal_mask, pos)
         labels = input_ids[:, token_start + 1 : token_start + 1 + valid_len].long()
         valid = (
@@ -458,13 +505,27 @@ def forward_glm_mtp(
             if loss_mask is None
             else loss_mask[:, token_start + 1 : token_start + 1 + valid_len].bool()
         )
-        distill_alpha = float(os.environ.get("SPECULATORS_MTP_DISTILL_ALPHA", "0"))
         if distill_alpha > 0:
             v_slice = hidden_states[:, token_start : token_start + valid_len]
-            d_loss, d_agree = _glm_chunked_distill(model, output, v_slice, valid)
+            if agree_filter:
+                v_arg = (
+                    v_tok[:, 1 : valid_len + 1]
+                    if teacher_force
+                    else _glm_chunked_argmax(model, v_slice)
+                )
+                valid_eff = (labels == v_arg) & valid
+                metrics[f"agree_rate_step_{step}"] = (
+                    valid_eff.sum().float() / valid.sum().clamp_min(1)
+                ).detach()
+            else:
+                valid_eff = valid
+            d_loss, d_agree = _glm_chunked_distill(model, output, v_slice, valid_eff)
             metrics[f"align_step_{step}"] = d_agree.detach()
             step_loss, step_acc, count = _glm_chunked_ce(
-                model, output, labels, valid,
+                model,
+                output,
+                labels,
+                valid_eff,
             )
             step_loss = distill_alpha * d_loss + (1 - distill_alpha) * step_loss
         else:
@@ -473,8 +534,8 @@ def forward_glm_mtp(
                 output,
                 labels,
                 valid,
-            chunk_size=chunk_size,
-        )
+                chunk_size=chunk_size,
+            )
         weight = 1.0 if step_weights is None else float(step_weights[step])
         weighted_losses.append(step_loss * weight)
         metrics[f"loss_step_{step}"] = (step_loss * weight).detach()
