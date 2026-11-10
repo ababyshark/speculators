@@ -131,3 +131,21 @@ A 原始 3.224/3.640 vs A float 3.324/3.729 vs **B v20 3.058/3.380（训练差 -
 - `assemble_xql.py` / `assemble_onpolicy_v2.py`：text 重编码 + roundtrip 校验 → Arrow
 - `serve_gen.sh` / `serve_native.sh`：生成端点（PORT/DEVICES/TAG 环境变量）
 - `watchdog_xql2.sh`：双端点看门狗（30s 检活，kill→120s→重启→等就绪）
+
+
+## 10. 接受率地图与项目终局（2026-11-10，最终章）
+
+novel-32K（swezero 轨迹续写，不可抄写）= 3.585；32K 可抄写 = 3.797。九连负 +
+接受率地图（2.76-3.80 覆盖短/长、通用/内部、可抄写/不可抄写）全部收录在根
+HANDOFF §1.12。**最终交付 = 官方 W4A8 包原样**；微调正向空间需真实生产低接受率
+样本（prompt 原文）→ per-sample 测量 → margin 诊断 → 定向训练（工具链就绪）。
+
+### 10.1 32K 长上下文与 on-policy 管线脚本（可复用）
+- `build_32k_eval.py`：内部案例拼接 32K 评测集（可抄写对照版）
+- `build_novel32k.py`：swezero 同仓轨迹拼接 32K 续写评测集（不可抄写版）
+- `build_32k_10k.py`：三源混合 10k 条 32K 训练集（流式 Arrow，pb/xql/cmb 混合）
+- `run_novel32k_v3.sh`：阶梯探针分块评测（tiny probe → 32K probe → 分块，
+  引擎在 32K 大请求下崩溃的自愈式验证法）
+- 关键运维：40 机存在双后端脑裂 NFS（同一 /mnt/share_space 路径两机视图不同，
+  inode 已验证）——跨机文件一律 tar+scp；引擎在长空闲/强杀后静默死亡（ERR99999），
+  重启容器可复位；就绪探针必须用真实生成（/v1/models 有假阳性）
